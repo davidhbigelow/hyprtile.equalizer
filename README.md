@@ -1,7 +1,7 @@
 # hyprtile.equalize
 
 ## A simple Plugin for Omarchy Quatro
-Inspiration after seeing a great idea to address some accepted friction with Hyperland.
+Inspiration after seeing a great idea to address some accepted friction with Hyprland.
 
 https://www.youtube.com/watch?v=KO2T0oET9go
 
