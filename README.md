@@ -1,0 +1,1 @@
+# hyprtile.equalizer
