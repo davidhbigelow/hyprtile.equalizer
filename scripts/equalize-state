@@ -1,11 +1,46 @@
-#!/bin/bash
-# Print 1 if the ACTIVE workspace is equalized, else 0.
-# Per-desktop model: each desktop you press SUPER+E on is independently
-# equalized and stays that way when you switch away and back.
-SET_FILE="$HOME/.config/omarchy/equalize-desktops"
-ACTIVE=$(hyprctl activeworkspace -j 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
-if [[ -n $ACTIVE ]] && grep -qx "$ACTIVE" "$SET_FILE" 2>/dev/null; then
-  printf '1\n'
-else
-  printf '0\n'
-fi
+#!/usr/bin/env python3
+"""Report whether the active workspace is currently equalized."""
+
+import json
+import os
+import subprocess
+import sys
+
+from _equalize_state import workspace_is_equalized
+
+HYPRCTL_TIMEOUT = float(os.environ.get("EQUALIZE_HYPRCTL_TIMEOUT", "1.5"))
+HYPRCTL_OUTPUT_LIMIT = 64 * 1024
+
+
+def active_workspace_id():
+    try:
+        proc = subprocess.run(
+            ["hyprctl", "activeworkspace", "-j"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=HYPRCTL_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        return None
+    if len(proc.stdout) > HYPRCTL_OUTPUT_LIMIT:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    wid = payload.get("id")
+    return wid if isinstance(wid, int) else None
+
+
+def main() -> int:
+    wid = active_workspace_id()
+    if wid is None:
+        print("0")
+        return 0
+    print("1" if workspace_is_equalized(wid) else "0")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

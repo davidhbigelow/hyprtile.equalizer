@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Shared state helpers for HyprTile equalizer scripts.
+
+This module centralizes access to the private state directory, which keeps the
+set of equalized workspace ids as well as the watcher PID/lock files. The
+directory lives under XDG_STATE_HOME (fallback: ~/.local/state) and is created
+with mode 700 so no other users can interfere with its contents.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import tempfile
+import time
+from typing import Callable, Iterable, Optional, Set
+
+STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.join(
+    os.path.expanduser("~"), ".local", "state"
+)
+STATE_DIR = os.path.join(STATE_HOME, "hyprtile.equalizer")
+WORKSPACE_FILE = os.path.join(STATE_DIR, "equalized-workspaces")
+PID_FILE = os.path.join(STATE_DIR, "watcher.pid")
+LOCK_FILE = os.path.join(STATE_DIR, "watcher.lock")
+
+MAX_SET_BYTES = 64 * 1024
+MAX_PID_BYTES = 4 * 1024
+
+
+def _secure_flags(flags: int) -> int:
+    flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW  # type: ignore[attr-defined]
+    return flags
+
+
+def _ensure_state_dir() -> None:
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    try:
+        st_mode = os.stat(STATE_DIR).st_mode & 0o777
+        if st_mode != 0o700:
+            os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def _parse_ids(raw: str) -> Set[int]:
+    ids: Set[int] = set()
+    for token in raw.split():
+        token = token.strip()
+        if not token:
+            continue
+        if token.lstrip("-").isdigit():
+            try:
+                ids.add(int(token))
+            except ValueError:
+                continue
+    return ids
+
+
+def _read_ids(lock_type: Optional[int]) -> Set[int]:
+    _ensure_state_dir()
+    try:
+        fd = os.open(WORKSPACE_FILE, _secure_flags(os.O_RDONLY))
+    except FileNotFoundError:
+        return set()
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        if lock_type is not None:
+            fcntl.flock(handle.fileno(), lock_type)
+        data = handle.read(MAX_SET_BYTES + 1)
+    if len(data) > MAX_SET_BYTES:
+        return set()
+    return _parse_ids(data)
+
+
+def load_workspace_ids() -> Set[int]:
+    """Return the set of workspace ids currently marked equalized."""
+
+    return _read_ids(fcntl.LOCK_SH)
+
+
+def _update_ids(mutator: Callable[[Set[int]], Set[int]]) -> Set[int]:
+    _ensure_state_dir()
+    flags = _secure_flags(os.O_RDWR | os.O_CREAT)
+    fd = os.open(WORKSPACE_FILE, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    with os.fdopen(fd, "r+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        data = handle.read(MAX_SET_BYTES + 1)
+        if len(data) > MAX_SET_BYTES:
+            ids = set()
+        else:
+            ids = _parse_ids(data)
+        new_ids = mutator(set(ids))
+        handle.seek(0)
+        handle.truncate()
+        if new_ids:
+            handle.write("\n".join(str(i) for i in sorted(new_ids)))
+            handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return new_ids
+
+
+def replace_workspace_ids(new_ids: Iterable[int]) -> Set[int]:
+    new_set = set(int(i) for i in new_ids)
+    return _update_ids(lambda _old: new_set)
+
+
+def clear_workspace_ids() -> None:
+    _update_ids(lambda _old: set())
+
+
+def toggle_workspace_id(workspace_id: int) -> bool:
+    """Toggle workspace_id membership; return True if the id is now enabled."""
+
+    workspace_id = int(workspace_id)
+    enabled = False
+
+    def mutate(prev: Set[int]) -> Set[int]:
+        nonlocal enabled
+        if workspace_id in prev:
+            prev.remove(workspace_id)
+            enabled = False
+        else:
+            prev.add(workspace_id)
+            enabled = True
+        return prev
+
+    _update_ids(mutate)
+    return enabled
+
+
+def workspace_is_equalized(workspace_id: int) -> bool:
+    return workspace_id in load_workspace_ids()
+
+
+def acquire_watcher_lock() -> int:
+    """Return an exclusive-lock fd that enforces a single watcher instance."""
+
+    _ensure_state_dir()
+    flags = _secure_flags(os.O_RDWR | os.O_CREAT)
+    fd = os.open(LOCK_FILE, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def write_pid_record(pid: int, script_path: str) -> None:
+    _ensure_state_dir()
+    record = {
+        "pid": int(pid),
+        "script": os.path.realpath(script_path),
+        "timestamp": time.time(),
+    }
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=STATE_DIR, prefix="pid-", text=True)
+    try:
+        os.fchmod(tmp_fd, 0o600)
+    except OSError:
+        pass
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp:
+            json.dump(record, tmp)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_path, PID_FILE)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+
+
+def read_pid_record() -> Optional[dict]:
+    try:
+        fd = os.open(PID_FILE, _secure_flags(os.O_RDONLY))
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        data = handle.read(MAX_PID_BYTES + 1)
+    if len(data) > MAX_PID_BYTES:
+        return None
+    try:
+        record = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(record, dict):
+        return None
+    pid = record.get("pid")
+    script = record.get("script")
+    if not isinstance(pid, int) or not isinstance(script, str):
+        return None
+    result = {"pid": pid, "script": script}
+    ts = record.get("timestamp")
+    if isinstance(ts, (int, float)):
+        result["timestamp"] = float(ts)
+    return result
+
+
+def remove_pid_record() -> None:
+    try:
+        os.unlink(PID_FILE)
+    except FileNotFoundError:
+        pass
+
+
+__all__ = [
+    "STATE_DIR",
+    "WORKSPACE_FILE",
+    "PID_FILE",
+    "LOCK_FILE",
+    "MAX_SET_BYTES",
+    "load_workspace_ids",
+    "replace_workspace_ids",
+    "clear_workspace_ids",
+    "toggle_workspace_id",
+    "workspace_is_equalized",
+    "acquire_watcher_lock",
+    "write_pid_record",
+    "read_pid_record",
+    "remove_pid_record",
+]

@@ -55,7 +55,19 @@ tiling when you turn it off.
    - Adds an autostart entry for the `scripts/equalize-watch` daemon.
    - Reloads Hyprland (if running) and restarts the watcher in-place.
 3. Add the widget to your bar if it did not show up automatically:
-   `omarchy bar add hyprtile.equalize --section right`.
+   `omarchy plugin enable hyprtile.equalize --section right --index end`.
+
+### Re-adding after Omarchy removal
+If you removed the plugin through the Omarchy plugin manager, the shell forgets
+its manifest and bar placement. To bring it back without restarting the whole
+shell:
+
+1. Copy/clone this repo into `~/.config/omarchy/plugins/hyprtile.equalize/`.
+2. Re-run `~/.config/omarchy/plugins/hyprtile.equalize/install.sh`.
+3. Refresh the shell's plugin index: `omarchy-shell shell rescanPlugins`.
+4. Re-enable the bar widget: `omarchy plugin enable hyprtile.equalize --section right --index end`.
+
+Those commands only touch this plugin; other widgets keep running.
 
 The plugin lives entirely inside that directory. Removing it and deleting the
 lines the installer appended to `hypr/bindings.lua` and `hypr/autostart.lua`
