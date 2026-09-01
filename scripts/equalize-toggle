@@ -1,0 +1,19 @@
+#!/bin/bash
+# Toggle equalize for the ACTIVE workspace and print the new state (1 = on,
+# 0 = off). Per-desktop model: each press adds/removes the current desktop
+# from the equalized set; other desktops are unaffected.
+SET_FILE="$HOME/.config/omarchy/equalize-desktops"
+ACTIVE=$(hyprctl activeworkspace -j 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+if [[ -n $ACTIVE ]]; then
+  touch "$SET_FILE"
+  if grep -qx "$ACTIVE" "$SET_FILE" 2>/dev/null; then
+    grep -vx "$ACTIVE" "$SET_FILE" > "$SET_FILE.tmp" 2>/dev/null; mv "$SET_FILE.tmp" "$SET_FILE"
+  else
+    printf '%s\n' "$ACTIVE" >> "$SET_FILE"
+  fi
+fi
+STATE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/equalize-state"
+if [[ ! -f "$STATE_SCRIPT" ]]; then
+  STATE_SCRIPT="$HOME/.local/bin/omarchy-equalize-state"
+fi
+exec "$STATE_SCRIPT"

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "hyprtile.equalize",
+  "name": "Equalize toggle",
+  "version": "1.0.0",
+  "author": "David (Deuce) Bigelow",
+  "description": "Toggle live window-equalize mode (SUPER+E grid)",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "EqualizeToggle.qml"
+  },
+  "barWidget": {
+    "displayName": "Equalize toggle",
+    "description": "Toggle live window-equalize (SUPER+E) mode on/off",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

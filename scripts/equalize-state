@@ -1,0 +1,11 @@
+#!/bin/bash
+# Print 1 if the ACTIVE workspace is equalized, else 0.
+# Per-desktop model: each desktop you press SUPER+E on is independently
+# equalized and stays that way when you switch away and back.
+SET_FILE="$HOME/.config/omarchy/equalize-desktops"
+ACTIVE=$(hyprctl activeworkspace -j 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+if [[ -n $ACTIVE ]] && grep -qx "$ACTIVE" "$SET_FILE" 2>/dev/null; then
+  printf '1\n'
+else
+  printf '0\n'
+fi
