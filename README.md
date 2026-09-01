@@ -1,5 +1,30 @@
 # hyprtile.equalize
 
+## A simple Plugin for Omarchy Quatro
+Inspiration after seeing a great idea to address some accepted friction with Hyperland.
+
+https://www.youtube.com/watch?v=KO2T0oET9go
+
+
+## What it does
+- SUPERKEY + E = Toggle from Default Hyprland Tile Layout to Equal Window Size Layout.
+
+<table>
+  <tr>
+    <th>BEFORE/AFTER Toggle</th>
+    <th>BEFORE/AFTER Toggle</th>
+  </tr>
+  <tr>
+    <td><img width="3838" height="2400" alt="allWindows" src="https://github.com/user-attachments/assets/cd48e948-4de1-4fe1-9c62-549770b02b95" /></td>
+    <td><img width="3838" height="2400" alt="allWindows2" src="https://github.com/user-attachments/assets/1f525cc6-4cf3-4d39-a234-c2ae1217b6f7" /></td>
+  </tr>
+</table>
+
+
+
+
+
+
 Floating grid equalizer for Hyprland desktops. The toolbar toggle and
 `SUPER+E` keybinding keep whichever workspace you opt into a perfectly tiled,
 floating grid that re-centers windows after drags/resizes and restores normal
