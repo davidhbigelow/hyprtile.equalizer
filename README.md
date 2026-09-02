@@ -37,8 +37,9 @@ tiling when you turn it off.
   around the drop target after a short debounce.
 - Resize pinning: when you resize a tile with `SUPER +/-`, that tile keeps the
   new size while the rest of the grid re-equalizes around it.
-- Session-remembered layouts: toggling off/on without changing the tile set
-  restores the exact (x, y, w, h) layout that was last organized.
+- Clean toggle-off: turning equalize off de-floats every window on the
+  desktop in one batch, and Hyprland's native layout engine re-tiles the
+  workspace from scratch (no reconstruction, nothing left stranded).
 - Toolbar toggle button mirrors the keyboard shortcut and shows the current
   state via the icon glyph (grid vs dashboard).
 - Optional "Fill leftover space" mode stretches a tile to cover the unused
@@ -83,23 +84,31 @@ uninstalls it cleanly.
 - Toggle with the toolbar button or `SUPER+E`. Each desktop remembers its own
   state so you can leave development workspaces equalized while keeping others
   untouched.
-- When live-equalize turns off, the active tile is briefly emphasized before
-  every window returns to stock tiling.
+- When live-equalize turns off, every window on the desktop is de-floated in
+  one batch and Hyprland's native tiling takes over again.
 - All helper scripts live under `scripts/` and are referenced by absolute path
   so the plugin remains self-contained. You can run them manually while
   developing (e.g., `scripts/equalize-watch --help`).
 - Click the toolbar icon to open a mini control panel. From there you can
-  toggle live equalize and enable/disable the "Fill leftover space" option,
-  which widens the last tile to fill any empty slot in the grid when the window
-  count leaves a gap.
+  toggle live equalize and pick the "Fill leftover space" direction with a
+  segmented control: `Off` leaves incomplete rows as they are, `Horizontal`
+  widens the last tile to the row end, and `Vertical` pulls the tile above
+  the empty corner down to the bottom of the work area. Changing the
+  direction adjusts only the affected tile in place.
+- The same setting is scriptable from the command line:
+  `scripts/equalize-settings get fill-remainder`,
+  `scripts/equalize-settings set fill-remainder vertical` (or
+  `horizontal`/`off`), and `scripts/equalize-settings list` dumps all
+  settings as JSON. A legacy `true`/`false` value resolves to
+  `horizontal`/`off`.
 
 ## Packaging a Release Tarball
 Run `./package.sh` from this directory. The script:
 
 1. Reads the version from `manifest.json`.
 2. Creates `dist/hyprtile.equalize-<version>.tar.gz` containing:
-   `manifest.json`, `EqualizeToggle.qml`, `install.sh`, `scripts/`, and this
-   README under a top-level `hyprtile.equalize/` folder.
+   `manifest.json`, `LICENSE`, `EqualizeToggle.qml`, `install.sh`, `scripts/`,
+   and this README under a top-level `hyprtile.equalize/` folder.
 
 You can share that archive directly; the recipient only needs to unpack it into
 `~/.config/omarchy/plugins/` and run the bundled `install.sh`.
