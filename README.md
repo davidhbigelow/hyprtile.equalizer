@@ -41,8 +41,12 @@ tiling when you turn it off.
   restores the exact (x, y, w, h) layout that was last organized.
 - Toolbar toggle button mirrors the keyboard shortcut and shows the current
   state via the icon glyph (grid vs dashboard).
-- Optional "Fill leftover space" mode stretches the last tile to cover the
-  unused slot when a grid row is incomplete.
+- Optional "Fill leftover space" mode stretches a tile to cover the unused
+  slot when a grid row is incomplete. The stretch direction is a picker
+  (`off` | `horizontal` | `vertical`): horizontal widens the bottom-right tile
+  to the row end, vertical pulls the tile above the empty corner down to the
+  bottom of the work area. Changing direction adjusts only the affected
+  tile(s) in place, without re-laying-out the grid.
 
 ## Requirements
 - Hyprland with the `hl.dsp.*` dispatch helpers (0.44+ recommended).

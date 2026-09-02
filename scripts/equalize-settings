@@ -5,10 +5,19 @@ import argparse
 import json
 import sys
 
-from _equalize_state import get_config_bool, load_config, set_config_value, toggle_config_bool
+from _equalize_state import (
+    FILL_CHOICES,
+    cycle_config_choice,
+    get_config_bool,
+    get_config_choice,
+    load_config,
+    set_config_choice,
+    set_config_value,
+    toggle_config_bool,
+)
 
 KEYS = {
-    "fill-remainder": "fill_remainder",
+    "fill-remainder": ("fill_remainder", "choice", FILL_CHOICES),
 }
 
 
@@ -21,6 +30,10 @@ def parse_bool(value: str) -> bool:
     if normalized in falsy:
         return False
     raise ValueError(f"Unknown boolean value: {value}")
+
+
+def print_choice(value: str) -> None:
+    print(value)
 
 
 def print_bool(value: bool) -> None:
@@ -45,7 +58,10 @@ def main() -> int:
 
     args = parser.parse_args()
     key = getattr(args, "key", None)
-    mapped_key = KEYS.get(key) if key else None
+    mapped = KEYS.get(key) if key else None
+    mapped_key = mapped[0] if mapped else None
+    kind = mapped[1] if mapped else None
+    choices = mapped[2] if mapped else None
 
     if args.action == "list":
         json.dump(load_config(), sys.stdout, indent=2, sort_keys=True)
@@ -56,21 +72,32 @@ def main() -> int:
         parser.error("missing key")
 
     if args.action == "get":
-        print_bool(get_config_bool(mapped_key))
+        if kind == "choice":
+            print_choice(get_config_choice(mapped_key, choices))
+        else:
+            print_bool(get_config_bool(mapped_key))
         return 0
 
     if args.action == "set":
-        try:
-            value = parse_bool(args.value)
-        except ValueError as exc:
-            parser.error(str(exc))
-        set_config_value(mapped_key, value)
-        print_bool(get_config_bool(mapped_key))
+        if kind == "choice":
+            stored = set_config_choice(mapped_key, args.value, choices)
+            print_choice(stored)
+        else:
+            try:
+                value = parse_bool(args.value)
+            except ValueError as exc:
+                parser.error(str(exc))
+            set_config_value(mapped_key, value)
+            print_bool(get_config_bool(mapped_key))
         return 0
 
     if args.action == "toggle":
-        new_value = toggle_config_bool(mapped_key)
-        print_bool(new_value)
+        if kind == "choice":
+            new_value = cycle_config_choice(mapped_key, choices)
+            print_choice(new_value)
+        else:
+            new_value = toggle_config_bool(mapped_key)
+            print_bool(new_value)
         return 0
 
     parser.error("unknown action")

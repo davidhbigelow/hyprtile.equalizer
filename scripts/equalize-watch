@@ -18,7 +18,7 @@ from _equalize_state import (
     acquire_watcher_lock,
     clear_snapshot,
     clear_workspace_ids,
-    get_config_bool,
+    get_config_choice,
     load_workspace_ids,
     read_pid_record,
     remove_pid_record,
@@ -173,6 +173,11 @@ def dispatch(cmd):
     the toggle-off sequence. Falls back to a `hyprctl` subprocess if the socket
     is unavailable.
     """
+    try:
+        if os.environ.get("EQUALIZE_DEBUG_SEND"):
+            print(f"DISPATCH {cmd}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
     try:
         if IPC_SOCKET and os.path.exists(IPC_SOCKET):
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -416,14 +421,60 @@ def nearest_layout(mon, ws, prio_order=None, force_first_addr=None):
     return targets, applied
 
 
-def extend_last_cell(mon, targets, applied, fill_remainder):
-    if not fill_remainder or len(targets) < 2 or not applied:
+def fill_target_cell(mon, ws, fill_dir):
+    """Cell index of the tile that `fill_dir` stretches, or None when not applicable.
+
+    horizontal -> the last cell (bottom-right; stretched rightward to row end).
+    vertical   -> the cell directly above the empty bottom-right corner
+                  (stretched downward to the work area bottom).
+    Both require a partial last row (n % cols != 0) and at least two windows.
+    """
+    if fill_dir in (None, "off"):
+        return None
+    cells = cell_list(mon, ws)
+    n = len(cells)
+    if n < 2 or n % math.ceil(math.sqrt(n)) == 0:
+        return None
+    cols = max(1, math.ceil(math.sqrt(n)))
+    if fill_dir == "horizontal":
+        return n - 1
+    rows_n = math.ceil(n / cols)
+    idx = (rows_n - 2) * cols + (cols - 1)
+    return idx if 0 <= idx < n else None
+
+
+def extend_last_cell(mon, targets, applied, fill_dir):
+    if fill_dir in (None, "off") or len(targets) < 2 or not applied:
         return targets
     n = len(targets)
     cols = max(1, math.ceil(math.sqrt(n)))
     if n % cols == 0:
         return targets
     rows_n = math.ceil(n / cols)
+    g = geometry(mon)
+    pad = GAPS_OUT + BORDER
+    rx = g["l"] + pad
+    ry = g["t"] + pad
+    rw = g["w"] - 2 * pad
+    rh = g["h"] - 2 * pad
+
+    if fill_dir == "vertical":
+        target_cell = (rows_n - 2) * cols + (cols - 1)
+        if not (0 <= target_cell < n):
+            return targets
+        addr = next((a for a, c in applied.items() if c == target_cell), None)
+        if addr is None:
+            return targets
+        ti = next((i for i, (a2, *_r) in enumerate(targets) if a2 == addr), None)
+        if ti is None:
+            return targets
+        a2, x, y, w, h = targets[ti]
+        new_h = int(round((ry + rh) - y))
+        if new_h > h:
+            targets[ti] = (a2, x, y, w, new_h)
+        return targets
+
+    # horizontal (legacy default)
     last_cell = max(applied.values(), default=None)
     if last_cell is None or last_cell // cols != rows_n - 1:
         return targets
@@ -434,10 +485,6 @@ def extend_last_cell(mon, targets, applied, fill_remainder):
             break
     if target_idx is None:
         return targets
-    g = geometry(mon)
-    pad = GAPS_OUT + BORDER
-    rx = g["l"] + pad
-    rw = g["w"] - 2 * pad
     row_end = rx + rw
     addr, x, y, w, h = targets[target_idx]
     new_w = int(round(row_end - x))
@@ -446,71 +493,73 @@ def extend_last_cell(mon, targets, applied, fill_remainder):
     return targets
 
 
-def apply_fill_in_place(mon, ws, fill_on, current_rects):
-    """Stretch/un-stretch only the last-row tile, without re-laying-out the grid.
+def apply_fill_in_place(mon, ws, fill_dir, current_rects, cell_map, stretch_state):
+    """Adjust only the stretched tile(s) when the fill direction changes.
 
-    The stretch option widens the rightmost tile of the bottom row so it reaches
-    the row's right edge. Toggling it should adjust just that one window, leaving
-    every other tile exactly where it is. `current_rects` is the active grid
-    (address -> (x, y, w, h)); we return the updated rect map.
-
-    Returns (updated_rects, changed_addr) or (current_rects, None) when there is
-    nothing to adjust.
+    `stretch_state` is the previous (addr, dir) we stretched, or (None, None).
+    Returns (updated_rects, new_stretch_state).
     """
-    g = geometry(mon)
-    pad = GAPS_OUT + BORDER
-    rx = g["l"] + pad
-    rw = g["w"] - 2 * pad
-    row_end = rx + rw
-
     cells = cell_list(mon, ws)
     n = len(cells)
-    if n < 2:
-        return current_rects, None
-    cols = max(1, math.ceil(math.sqrt(n)))
-    # Index of the last (row-major) cell.
-    last_idx = n - 1
-    last_cell = cells[last_idx]
-    cxl, cyl, cx, cy, cw, ch = last_cell
-
-    # The window in the last row whose left edge sits at the last cell's x.
-    # We match by the cell's top-left corner (x, y) + row, because a stretched
-    # tile's center moves right of its cell and would fail a center-point test.
-    lx, ly = last_cell[2], last_cell[3]
-    cand = None
-    for addr, (ax, ay, aw, ah) in current_rects.items():
-        if abs(ax - lx) <= 2 and ly - 2 <= ay <= ly + ch:
-            cand = addr
-            break
-    if cand is None:
-        return current_rects, None
-
-    if fill_on:
-        # Widen the tile to the row's right edge; keep x so the left edge stays.
-        ax, ay, aw, ah = current_rects[cand]
-        new_w = int(round(row_end - ax))
-        if new_w <= aw:
-            return current_rects, None
-        new_rect = (ax, ay, new_w, ah)
-        dispatch(f'hl.dsp.window.resize({{ window = "address:{cand}", x = {new_w}, y = {ah}, relative = false }})')
-        dispatch(f'hl.dsp.window.move({{ window = "address:{cand}", x = {ax}, y = {ay}, relative = false }})')
-    else:
-        # Restore the tile to its natural cell width (top-left anchored at the
-        # cell origin).
-        ax, ay, aw, ah = current_rects[cand]
-        dispatch(f'hl.dsp.window.resize({{ window = "address:{cand}", x = {cw}, y = {ch}, relative = false }})')
-        dispatch(f'hl.dsp.window.move({{ window = "address:{cand}", x = {cx}, y = {cy}, relative = false }})')
-        new_rect = (cx, cy, cw, ch)
+    g = geometry(mon)
+    pad = GAPS_OUT + BORDER
+    row_end = g["l"] + pad + (g["w"] - 2 * pad)
+    bottom = g["t"] + pad + (g["h"] - 2 * pad)
 
     updated = dict(current_rects)
-    updated[cand] = new_rect
-    return updated, cand
+    prev_addr, prev_dir = stretch_state
+
+    def natural_cell_for(addr):
+        idx = cell_map.get(addr)
+        if idx is None or idx >= len(cells):
+            return None
+        _, _, nx, ny, nw, nh = cells[idx]
+        return (nx, ny, nw, nh)
+
+    def restore_tile(addr):
+        nat = natural_cell_for(addr)
+        if nat is None:
+            return
+        nx, ny, nw, nh = nat
+        dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {nw}, y = {nh}, relative = false }})')
+        dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {nx}, y = {ny}, relative = false }})')
+        updated[addr] = (nx, ny, nw, nh)
+
+    # Restore the previously-stretched tile if it is no longer the target.
+    new_target_cell = fill_target_cell(mon, ws, fill_dir)
+    new_target_addr = None
+    if new_target_cell is not None:
+        new_target_addr = next((a for a, c in cell_map.items() if c == new_target_cell), None)
+
+    if prev_addr and (prev_addr != new_target_addr or fill_dir == "off"):
+        restore_tile(prev_addr)
+
+    if fill_dir == "off" or new_target_addr is None or new_target_cell is None:
+        return updated, (None, None)
+
+    # Stretch the new target tile in place.
+    _, _, tx, ty, tw, th = cells[new_target_cell]
+    ax, ay, aw, ah = updated.get(new_target_addr, (tx, ty, tw, th))
+    if fill_dir == "horizontal":
+        new_w = int(round(row_end - ax))
+        new_rect = (ax, ay, new_w, ah) if new_w > aw else (ax, ay, aw, ah)
+    else:  # vertical
+        new_h = int(round(bottom - ay))
+        new_rect = (ax, ay, aw, new_h) if new_h > ah else (ax, ay, aw, ah)
+
+    if new_rect != updated.get(new_target_addr):
+        nx, ny, nw, nh = new_rect
+        dispatch(f'hl.dsp.window.resize({{ window = "address:{new_target_addr}", x = {nw}, y = {nh}, relative = false }})')
+        dispatch(f'hl.dsp.window.move({{ window = "address:{new_target_addr}", x = {nx}, y = {ny}, relative = false }})')
+        updated[new_target_addr] = new_rect
+
+    return updated, (new_target_addr, fill_dir)
 
 
-def apply_grid(mon, ws, prio_order=None, fill_remainder=False, force_first_addr=None):
+def apply_grid(mon, ws, prio_order=None, fill_dir="off", force_first_addr=None):
     """Float + equalize all managed windows. Returns (applied_map, sizes, rects)."""
     targets, applied = nearest_layout(mon, ws, prio_order, force_first_addr)
-    targets = extend_last_cell(mon, targets, applied, fill_remainder)
+    targets = extend_last_cell(mon, targets, applied, fill_dir)
     sizes = {}
     rects = {}
     for addr, x, y, w, h in targets:
@@ -686,11 +735,11 @@ def resize_fit_layout(mon, ws, pinned_addr):
     return targets, applied, (int(round(px)), int(round(py)), int(round(pw)), int(round(ph)))
 
 
-def apply_resize_fit(mon, ws, pinned_addr, fill_remainder=False):
+def apply_resize_fit(mon, ws, pinned_addr, fill_dir="off"):
     targets, applied, pin_box = resize_fit_layout(mon, ws, pinned_addr)
     pin_x, pin_y, pin_w, pin_h = pin_box
     combined = list(targets) + [(pinned_addr, pin_x, pin_y, pin_w, pin_h)]
-    combined = extend_last_cell(mon, combined, applied, fill_remainder)
+    combined = extend_last_cell(mon, combined, applied, fill_dir)
     targets = []
     sizes = {}
     rects = {}
@@ -804,10 +853,12 @@ def run_daemon():
         return
 
     now = time.monotonic()
-    fill_remainder = get_config_bool("fill_remainder")
-    last_fill = fill_remainder     # fill_remainder value we last acted on
+    fill_dir = get_config_choice("fill_remainder")
+    last_fill = fill_dir        # fill direction value we last acted on
+    stretch_state = (None, None)  # (addr, dir) of tile we last stretched in place
     last_apply = 0.0         # monotonic time we last applied a layout
     pending_apply = None     # (due_time, ws) queued event apply
+    fill_suppress_until = 0.0  # ignore our own fill-change events before this time
     off_state = (None, None)  # (off_seen frozenset, time first seen)
     current_map = {}         # address -> cell index of the layout we last applied
     current_rects = {}       # address -> (x, y, w, h) we last applied
@@ -823,11 +874,15 @@ def run_daemon():
 
     def reapply(mon, ws, prio=None, force_first=None):
         """Apply the equal grid and refresh tracking. Returns the cell map."""
-        nonlocal last_sizes, resized_seen, current_rects
-        m, s, rects = apply_grid(mon, ws, prio, fill_remainder, force_first)
+        nonlocal last_sizes, resized_seen, current_rects, stretch_state
+        m, s, rects = apply_grid(mon, ws, prio, fill_dir, force_first)
         last_sizes = s
         current_rects = rects
         resized_seen = set()
+        # The fresh grid already incorporates any stretch via extend_last_cell.
+        target_cell = fill_target_cell(mon, ws, fill_dir)
+        addr = next((a for a, c in m.items() if c == target_cell), None) if target_cell is not None else None
+        stretch_state = (addr, fill_dir) if addr else (None, None)
         return m
 
     def grid_if_needed(ws):
@@ -848,26 +903,34 @@ def run_daemon():
 
     try:
         while True:
-            fill_remainder = get_config_bool("fill_remainder")
+            fill_dir = get_config_choice("fill_remainder")
             now = time.monotonic()
             wanted = load_wanted()
 
-            # If the stretch option changed while a grid is active, adjust the
-            # last-row tile in place instead of re-laying-out the whole grid.
-            if fill_remainder != last_fill:
+            # If the stretch direction changed while a grid is active, adjust the
+            # affected tile(s) in place instead of re-laying-out the whole grid.
+            if fill_dir != last_fill:
                 mon_f, cur_f = monitor_and_ws()
                 if mon_f is not None and cur_f in grids and current_rects:
                     mon_f, cur_f = monitor_and_ws()
                     try:
-                        new_rects, _ = apply_fill_in_place(
-                            mon_f, cur_f, fill_remainder, current_rects
+                        if os.environ.get("EQUALIZE_DEBUG"):
+                            print(f"DBG fill change {last_fill}->{fill_dir} ws={cur_f} rects={len(current_rects)} cmap={len(current_map)} prev={stretch_state}", file=sys.stderr, flush=True)
+                        new_rects, stretch_state = apply_fill_in_place(
+                            mon_f, cur_f, fill_dir, current_rects, current_map, stretch_state
                         )
                         current_rects = new_rects
+                        # Refresh sizes snapshot so the resize detector does not
+                        # mistake our own stretch for a user resize and re-fit the
+                        # whole grid on top of it.
+                        last_sizes = {a: (r[2], r[3]) for a, r in new_rects.items()}
                         last_apply = now
                         off_state = (None, None)
+                        pending_apply = None
+                        fill_suppress_until = now + GRACE
                     except Exception:
                         traceback.print_exc()
-                last_fill = fill_remainder
+                last_fill = fill_dir
 
             # Release grids that are no longer marked equalized (toggle OFF).
             for wid in list(grids):
@@ -878,6 +941,7 @@ def run_daemon():
                     grids.discard(wid)
                     current_map = {}
                     current_rects = {}
+                    stretch_state = (None, None)
                     off_state = (None, None)
 
             mon, cur = monitor_and_ws()
@@ -911,11 +975,12 @@ def run_daemon():
                         w0, h0 = last_sizes[foc]
                         w1, h1 = sizes_now[foc]
                         if abs(w1 - w0) + abs(h1 - h0) >= 6:
-                            _, s, rects = apply_resize_fit(mon, cur, foc, fill_remainder)
+                            _, s, rects = apply_resize_fit(mon, cur, foc, fill_dir)
                             last_sizes = s
                             current_rects = rects
                             resized_seen.add(foc)
                             current_map = {}
+                            stretch_state = (None, None)
                             last_apply = now
                             off_state = (None, None)
                             continue
@@ -953,7 +1018,10 @@ def run_daemon():
                     # preserved (we never released them on switch-away).
                     grid_if_needed(cur)
                     if cur in grids:
-                        if line.startswith("movewindowv2>>"):
+                        # Ignore move/float events we just generated ourselves by
+                        # stretching a tile in place (see apply_fill_in_place).
+                        suppressed = time.monotonic() < fill_suppress_until
+                        if line.startswith("movewindowv2>>") and not suppressed:
                             raw = line[len("movewindowv2>>"):].split(",")
                             addr = normalize_address(raw[0]) if raw else None
                             try:
@@ -964,12 +1032,12 @@ def run_daemon():
                                 # Left the grid for another desktop: tile normally there.
                                 dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
                             pending_apply = (now + EVENT_DEBOUNCE, cur)
-                        elif line.startswith("movewindow>>"):
+                        elif line.startswith("movewindow>>") and not suppressed:
                             addr = normalize_address(line[len("movewindow>>"):].split(",")[0])
                             if addr:
                                 dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
                             pending_apply = (now + EVENT_DEBOUNCE, cur)
-                        elif line.startswith(("openwindow>>", "closewindow>>", "changefloatingmode>>")):
+                        elif line.startswith(("openwindow>>", "closewindow>>", "changefloatingmode>>")) and not suppressed:
                             pending_apply = (now + EVENT_DEBOUNCE, cur)
     finally:
         try:

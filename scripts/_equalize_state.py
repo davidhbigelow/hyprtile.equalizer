@@ -31,8 +31,12 @@ MAX_CONFIG_BYTES = 32 * 1024
 MAX_SNAPSHOT_BYTES = 256 * 1024
 
 CONFIG_DEFAULTS = {
-    "fill_remainder": False,
+    "fill_remainder": "off",
 }
+
+# Valid values for the fill_remainder choice: how the last/above-empty tile is
+# stretched to consume leftover workspace space.
+FILL_CHOICES = ("off", "horizontal", "vertical")
 
 
 def _secure_flags(flags: int) -> int:
@@ -305,6 +309,39 @@ def get_config_bool(key: str) -> bool:
     return bool(cfg.get(key, CONFIG_DEFAULTS.get(key, False)))
 
 
+def get_config_choice(key: str, choices: tuple = FILL_CHOICES, default: str = "off") -> str:
+    """Read an enum-style config value, coercing legacy booleans to a choice."""
+    cfg = load_config()
+    value = cfg.get(key, default)
+    if value in (True, "true", "1"):
+        return "horizontal" if "horizontal" in choices else choices[1]
+    if value in (False, "false", "0"):
+        return default
+    return value if value in choices else default
+
+
+def set_config_choice(key: str, value: str, choices: tuple = FILL_CHOICES, default: str = "off") -> str:
+    """Set an enum-style config value; normalizes and returns the stored value."""
+    value = str(value).strip().lower()
+    if value not in choices:
+        value = default
+    set_config_value(key, value)
+    return value
+
+
+def cycle_config_choice(key: str, choices: tuple = FILL_CHOICES, default: str = "off") -> str:
+    """Advance an enum-style config value to the next choice; returns it."""
+    current = get_config_choice(key, choices, default)
+    try:
+        idx = choices.index(current)
+    except ValueError:
+        idx = -1
+    next_idx = (idx + 1) % len(choices)
+    next_value = choices[next_idx]
+    set_config_value(key, next_value)
+    return next_value
+
+
 def _snapshot_path(workspace_id: int) -> str:
     return os.path.join(STATE_DIR, f"snapshot-{int(workspace_id)}.json")
 
@@ -411,6 +448,10 @@ __all__ = [
     "set_config_value",
     "toggle_config_bool",
     "get_config_bool",
+    "get_config_choice",
+    "set_config_choice",
+    "cycle_config_choice",
+    "FILL_CHOICES",
     "save_snapshot",
     "load_snapshot",
     "clear_snapshot",
