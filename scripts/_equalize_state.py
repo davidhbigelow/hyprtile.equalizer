@@ -23,9 +23,16 @@ STATE_DIR = os.path.join(STATE_HOME, "hyprtile.equalizer")
 WORKSPACE_FILE = os.path.join(STATE_DIR, "equalized-workspaces")
 PID_FILE = os.path.join(STATE_DIR, "watcher.pid")
 LOCK_FILE = os.path.join(STATE_DIR, "watcher.lock")
+CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
 
 MAX_SET_BYTES = 64 * 1024
 MAX_PID_BYTES = 4 * 1024
+MAX_CONFIG_BYTES = 32 * 1024
+MAX_SNAPSHOT_BYTES = 256 * 1024
+
+CONFIG_DEFAULTS = {
+    "fill_remainder": False,
+}
 
 
 def _secure_flags(flags: int) -> int:
@@ -215,12 +222,182 @@ def remove_pid_record() -> None:
         pass
 
 
+def load_config() -> dict:
+    _ensure_state_dir()
+    try:
+        fd = os.open(CONFIG_FILE, _secure_flags(os.O_RDONLY))
+    except FileNotFoundError:
+        return dict(CONFIG_DEFAULTS)
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        data = handle.read(MAX_CONFIG_BYTES + 1)
+    if len(data) > MAX_CONFIG_BYTES:
+        return dict(CONFIG_DEFAULTS)
+    try:
+        raw = json.loads(data) if data else {}
+    except json.JSONDecodeError:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    merged = dict(CONFIG_DEFAULTS)
+    for key, value in raw.items():
+        if isinstance(key, str):
+            merged[key] = value
+    return merged
+
+
+def _update_config(mutator: Callable[[dict], dict]) -> dict:
+    _ensure_state_dir()
+    flags = _secure_flags(os.O_RDWR | os.O_CREAT)
+    fd = os.open(CONFIG_FILE, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    with os.fdopen(fd, "r+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        data = handle.read(MAX_CONFIG_BYTES + 1)
+        try:
+            raw = json.loads(data) if data else {}
+        except json.JSONDecodeError:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        merged = dict(CONFIG_DEFAULTS)
+        for key, value in raw.items():
+            if isinstance(key, str):
+                merged[key] = value
+        new_cfg = mutator(dict(merged))
+        if not isinstance(new_cfg, dict):
+            new_cfg = dict(CONFIG_DEFAULTS)
+        handle.seek(0)
+        handle.truncate()
+        json.dump(new_cfg, handle)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return new_cfg
+
+
+def set_config_value(key: str, value) -> dict:
+    key = str(key)
+
+    def mutate(cfg: dict) -> dict:
+        cfg[key] = value
+        return cfg
+
+    return _update_config(mutate)
+
+
+def toggle_config_bool(key: str) -> bool:
+    key = str(key)
+
+    def mutate(cfg: dict) -> dict:
+        current = bool(cfg.get(key, CONFIG_DEFAULTS.get(key, False)))
+        cfg[key] = not current
+        return cfg
+
+    cfg = _update_config(mutate)
+    return bool(cfg.get(key, False))
+
+
+def get_config_bool(key: str) -> bool:
+    cfg = load_config()
+    return bool(cfg.get(key, CONFIG_DEFAULTS.get(key, False)))
+
+
+def _snapshot_path(workspace_id: int) -> str:
+    return os.path.join(STATE_DIR, f"snapshot-{int(workspace_id)}.json")
+
+
+def save_snapshot(workspace_id: int, entries) -> None:
+    """Persist the pre-grid layout for `workspace_id`.
+
+    `entries` is an iterable of dicts, one per managed window on the workspace,
+    each with keys: address, floating, x, y, w, h. Stored atomically in the
+    private state dir so a shell/compositor restart does not lose the layout.
+    """
+    _ensure_state_dir()
+    payload = [
+        {
+            "address": str(e.get("address", "")),
+            "floating": bool(e.get("floating", False)),
+            "x": int(e.get("x", 0)),
+            "y": int(e.get("y", 0)),
+            "w": int(e.get("w", 0)),
+            "h": int(e.get("h", 0)),
+        }
+        for e in entries
+    ]
+    data = json.dumps(payload)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=STATE_DIR, prefix="snap-", text=True)
+    try:
+        os.fchmod(tmp_fd, 0o600)
+    except OSError:
+        pass
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_path, _snapshot_path(workspace_id))
+    finally:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+
+
+def load_snapshot(workspace_id: int) -> list:
+    """Return the saved pre-grid layout for `workspace_id` as a list of dicts."""
+    try:
+        fd = os.open(_snapshot_path(workspace_id), _secure_flags(os.O_RDONLY))
+    except FileNotFoundError:
+        return []
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        data = handle.read(MAX_SNAPSHOT_BYTES + 1)
+    if len(data) > MAX_SNAPSHOT_BYTES:
+        return []
+    try:
+        raw = json.loads(data) if data else []
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        addr = str(e.get("address", ""))
+        if not addr:
+            continue
+        result.append(
+            {
+                "address": addr,
+                "floating": bool(e.get("floating", False)),
+                "x": int(e.get("x", 0)),
+                "y": int(e.get("y", 0)),
+                "w": int(e.get("w", 0)),
+                "h": int(e.get("h", 0)),
+            }
+        )
+    return result
+
+
+def clear_snapshot(workspace_id: int) -> None:
+    try:
+        os.unlink(_snapshot_path(workspace_id))
+    except FileNotFoundError:
+        pass
+
+
 __all__ = [
     "STATE_DIR",
     "WORKSPACE_FILE",
     "PID_FILE",
     "LOCK_FILE",
     "MAX_SET_BYTES",
+    "MAX_PID_BYTES",
+    "MAX_CONFIG_BYTES",
     "load_workspace_ids",
     "replace_workspace_ids",
     "clear_workspace_ids",
@@ -230,4 +407,11 @@ __all__ = [
     "write_pid_record",
     "read_pid_record",
     "remove_pid_record",
+    "load_config",
+    "set_config_value",
+    "toggle_config_bool",
+    "get_config_bool",
+    "save_snapshot",
+    "load_snapshot",
+    "clear_snapshot",
 ]

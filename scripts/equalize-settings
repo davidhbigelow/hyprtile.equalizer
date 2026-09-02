@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""CLI for managing HyprTile equalizer preferences."""
+
+import argparse
+import json
+import sys
+
+from _equalize_state import get_config_bool, load_config, set_config_value, toggle_config_bool
+
+KEYS = {
+    "fill-remainder": "fill_remainder",
+}
+
+
+def parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    truthy = {"1", "true", "on", "yes", "enable", "enabled"}
+    falsy = {"0", "false", "off", "no", "disable", "disabled"}
+    if normalized in truthy:
+        return True
+    if normalized in falsy:
+        return False
+    raise ValueError(f"Unknown boolean value: {value}")
+
+
+def print_bool(value: bool) -> None:
+    print("1" if value else "0")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Manage HyprTile equalizer settings")
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    get_p = sub.add_parser("get", help="print a setting")
+    get_p.add_argument("key", choices=KEYS.keys())
+
+    set_p = sub.add_parser("set", help="set a setting to a value")
+    set_p.add_argument("key", choices=KEYS.keys())
+    set_p.add_argument("value")
+
+    toggle_p = sub.add_parser("toggle", help="toggle a boolean setting")
+    toggle_p.add_argument("key", choices=KEYS.keys())
+
+    sub.add_parser("list", help="dump all settings as JSON")
+
+    args = parser.parse_args()
+    key = getattr(args, "key", None)
+    mapped_key = KEYS.get(key) if key else None
+
+    if args.action == "list":
+        json.dump(load_config(), sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return 0
+
+    if mapped_key is None:
+        parser.error("missing key")
+
+    if args.action == "get":
+        print_bool(get_config_bool(mapped_key))
+        return 0
+
+    if args.action == "set":
+        try:
+            value = parse_bool(args.value)
+        except ValueError as exc:
+            parser.error(str(exc))
+        set_config_value(mapped_key, value)
+        print_bool(get_config_bool(mapped_key))
+        return 0
+
+    if args.action == "toggle":
+        new_value = toggle_config_bool(mapped_key)
+        print_bool(new_value)
+        return 0
+
+    parser.error("unknown action")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

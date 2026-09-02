@@ -41,6 +41,8 @@ tiling when you turn it off.
   restores the exact (x, y, w, h) layout that was last organized.
 - Toolbar toggle button mirrors the keyboard shortcut and shows the current
   state via the icon glyph (grid vs dashboard).
+- Optional "Fill leftover space" mode stretches the last tile to cover the
+  unused slot when a grid row is incomplete.
 
 ## Requirements
 - Hyprland with the `hl.dsp.*` dispatch helpers (0.44+ recommended).
@@ -82,6 +84,10 @@ uninstalls it cleanly.
 - All helper scripts live under `scripts/` and are referenced by absolute path
   so the plugin remains self-contained. You can run them manually while
   developing (e.g., `scripts/equalize-watch --help`).
+- Click the toolbar icon to open a mini control panel. From there you can
+  toggle live equalize and enable/disable the "Fill leftover space" option,
+  which widens the last tile to fill any empty slot in the grid when the window
+  count leaves a gap.
 
 ## Packaging a Release Tarball
 Run `./package.sh` from this directory. The script:
