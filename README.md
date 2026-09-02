@@ -112,3 +112,33 @@ You can share that archive directly; the recipient only needs to unpack it into
   while iterating.
 - The shell plugin auto-reloads on save; if Quickshell somehow caches the old
   code, run `omarchy restart shell`.
+
+## Changelog
+
+### 1.1.0
+- New: "Fill leftover space" is now a direction picker (`off` |
+  `horizontal` | `vertical`) with a segmented control in the panel widget.
+  Changing the direction stretches only the affected tile in place instead of
+  re-laying-out the whole grid. The legacy boolean setting resolves to
+  `horizontal`.
+- Fixed: vertical fill no longer triggers a transient off-screen re-fit of the
+  bottom row; the watcher now refreshes its size cache after applying a fill
+  and suppresses events it generated itself.
+- Toggle-off now returns windows to native Hyprland tiling with a single
+  batched de-float (no snapshot reconstruction).
+- Hardening (from the plugin review):
+  - Strict validation is enforced at the `dispatch()` boundary: every window
+    address must be a bare `0x` hex id and every geometry value an integer,
+    and the whole command must match a narrow `hl.dsp.window.*` grammar
+    before it is sent to Hyprland.
+  - The watcher lifecycle is verified against `/proc` (cmdline realpath plus
+    process start-time fingerprint), so a recycled PID can never be signaled;
+    there are no `ps` substring scans anywhere.
+  - All state writes (workspace set, config, PID record, snapshots) are
+    atomic (`mkstemp` + `os.replace`), size-capped, `fsync`'d, and guarded by
+    dedicated `flock` lock files; reads are bounded and use `O_NOFOLLOW` in a
+    private `0700` state directory.
+  - The long-lived watcher caps `hyprctl` calls with a hard timeout and an
+    output-size limit, and processes at most a bounded number of socket
+    events per loop tick, so an event flood can never make one iteration do
+    unbounded work.

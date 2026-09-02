@@ -24,6 +24,10 @@ WORKSPACE_FILE = os.path.join(STATE_DIR, "equalized-workspaces")
 PID_FILE = os.path.join(STATE_DIR, "watcher.pid")
 LOCK_FILE = os.path.join(STATE_DIR, "watcher.lock")
 CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
+# Dedicated, never-replaced lock files guaranteeing mutual exclusion across
+# readers and writers even when the data files are atomically replaced.
+WORKSPACE_LOCK = os.path.join(STATE_DIR, "workspaces.lock")
+CONFIG_LOCK = os.path.join(STATE_DIR, "config.lock")
 
 MAX_SET_BYTES = 64 * 1024
 MAX_PID_BYTES = 4 * 1024
@@ -56,6 +60,38 @@ def _ensure_state_dir() -> None:
         pass
 
 
+def _atomic_write(path: str, text: str, max_bytes: int) -> bool:
+    """Write `text` to `path` atomically and enforce a size cap.
+
+    The bytes are staged as an unpredictable `mkstemp` file (0600) in the
+    private state dir, fsync'd, then atomically `os.replace`'d over `path`.
+    This guarantees a reader never observes a truncated or torn file even if
+    the process crashes mid-write, and prevents an unbounded payload from ever
+    being persisted. Returns False (and leaves `path` untouched) if the payload
+    exceeds `max_bytes`.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) > max_bytes:
+        return False
+    _ensure_state_dir()
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=STATE_DIR, prefix="tmp-", text=False)
+    try:
+        os.fchmod(tmp_fd, 0o600)
+        with os.fdopen(tmp_fd, "wb") as tmp:
+            tmp.write(encoded)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_path, path)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+
+
 def _parse_ids(raw: str) -> Set[int]:
     ids: Set[int] = set()
     for token in raw.split():
@@ -72,14 +108,27 @@ def _parse_ids(raw: str) -> Set[int]:
 
 def _read_ids(lock_type: Optional[int]) -> Set[int]:
     _ensure_state_dir()
+    data = ""
     try:
-        fd = os.open(WORKSPACE_FILE, _secure_flags(os.O_RDONLY))
-    except FileNotFoundError:
-        return set()
-    with os.fdopen(fd, "r", encoding="utf-8") as handle:
-        if lock_type is not None:
-            fcntl.flock(handle.fileno(), lock_type)
-        data = handle.read(MAX_SET_BYTES + 1)
+        lock_fd = os.open(WORKSPACE_LOCK, _secure_flags(os.O_RDWR | os.O_CREAT), 0o600)
+    except OSError:
+        lock_fd = None
+    try:
+        if lock_type is not None and lock_fd is not None:
+            fcntl.flock(lock_fd, lock_type)
+        try:
+            fd = os.open(WORKSPACE_FILE, _secure_flags(os.O_RDONLY))
+        except FileNotFoundError:
+            return set()
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            data = handle.read(MAX_SET_BYTES + 1)
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            except OSError:
+                pass
     if len(data) > MAX_SET_BYTES:
         return set()
     return _parse_ids(data)
@@ -93,27 +142,35 @@ def load_workspace_ids() -> Set[int]:
 
 def _update_ids(mutator: Callable[[Set[int]], Set[int]]) -> Set[int]:
     _ensure_state_dir()
-    flags = _secure_flags(os.O_RDWR | os.O_CREAT)
-    fd = os.open(WORKSPACE_FILE, flags, 0o600)
+    lock_fd = os.open(WORKSPACE_LOCK, _secure_flags(os.O_RDWR | os.O_CREAT), 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        os.fchmod(lock_fd, 0o600)
     except OSError:
         pass
-    with os.fdopen(fd, "r+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        data = handle.read(MAX_SET_BYTES + 1)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            fd = os.open(WORKSPACE_FILE, _secure_flags(os.O_RDONLY))
+        except FileNotFoundError:
+            data = ""
+        else:
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                data = handle.read(MAX_SET_BYTES + 1)
         if len(data) > MAX_SET_BYTES:
             ids = set()
         else:
             ids = _parse_ids(data)
         new_ids = mutator(set(ids))
-        handle.seek(0)
-        handle.truncate()
+        body = ""
         if new_ids:
-            handle.write("\n".join(str(i) for i in sorted(new_ids)))
-            handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+            body = "\n".join(str(i) for i in sorted(new_ids)) + "\n"
+        _atomic_write(WORKSPACE_FILE, body, MAX_SET_BYTES)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        except OSError:
+            pass
     return new_ids
 
 
@@ -168,11 +225,39 @@ def acquire_watcher_lock() -> int:
     return fd
 
 
+def proc_start_time(pid: int) -> Optional[int]:
+    """Return `/proc/PID/stat` field 22 (start time, clock ticks), or None.
+
+    A process ID can be recycled by the kernel, so cmdline/realpath matching
+    alone cannot prove a PID still names our own long-running watcher. The
+    start time is unique to a process incarnation and is stable for its whole
+    life, making it a reliable fingerprint against a PID-reuse race.
+    """
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as handle:
+            data = handle.read(4096)
+    except (OSError, ValueError):
+        return None
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return None
+    fields = data[rparen + 1:].split()
+    if len(fields) < 20:
+        return None
+    # After the ')' of the comm field (field 2), the next field is state
+    # (field 3). Field 22 (starttime) is therefore at index 22 - 3 = 19.
+    try:
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
 def write_pid_record(pid: int, script_path: str) -> None:
     _ensure_state_dir()
     record = {
         "pid": int(pid),
         "script": os.path.realpath(script_path),
+        "start": proc_start_time(pid),
         "timestamp": time.time(),
     }
     tmp_fd, tmp_path = tempfile.mkstemp(dir=STATE_DIR, prefix="pid-", text=True)
@@ -216,6 +301,9 @@ def read_pid_record() -> Optional[dict]:
     ts = record.get("timestamp")
     if isinstance(ts, (int, float)):
         result["timestamp"] = float(ts)
+    start = record.get("start")
+    if isinstance(start, int):
+        result["start"] = start
     return result
 
 
@@ -228,12 +316,28 @@ def remove_pid_record() -> None:
 
 def load_config() -> dict:
     _ensure_state_dir()
+    data = ""
+    lock_fd = None
     try:
-        fd = os.open(CONFIG_FILE, _secure_flags(os.O_RDONLY))
-    except FileNotFoundError:
-        return dict(CONFIG_DEFAULTS)
-    with os.fdopen(fd, "r", encoding="utf-8") as handle:
-        data = handle.read(MAX_CONFIG_BYTES + 1)
+        lock_fd = os.open(CONFIG_LOCK, _secure_flags(os.O_RDWR | os.O_CREAT), 0o600)
+    except OSError:
+        pass
+    try:
+        if lock_fd is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        try:
+            fd = os.open(CONFIG_FILE, _secure_flags(os.O_RDONLY))
+        except FileNotFoundError:
+            return dict(CONFIG_DEFAULTS)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            data = handle.read(MAX_CONFIG_BYTES + 1)
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            except OSError:
+                pass
     if len(data) > MAX_CONFIG_BYTES:
         return dict(CONFIG_DEFAULTS)
     try:
@@ -251,15 +355,21 @@ def load_config() -> dict:
 
 def _update_config(mutator: Callable[[dict], dict]) -> dict:
     _ensure_state_dir()
-    flags = _secure_flags(os.O_RDWR | os.O_CREAT)
-    fd = os.open(CONFIG_FILE, flags, 0o600)
+    lock_fd = os.open(CONFIG_LOCK, _secure_flags(os.O_RDWR | os.O_CREAT), 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        os.fchmod(lock_fd, 0o600)
     except OSError:
         pass
-    with os.fdopen(fd, "r+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        data = handle.read(MAX_CONFIG_BYTES + 1)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        data = ""
+        try:
+            fd = os.open(CONFIG_FILE, _secure_flags(os.O_RDONLY))
+        except FileNotFoundError:
+            pass
+        else:
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                data = handle.read(MAX_CONFIG_BYTES + 1)
         try:
             raw = json.loads(data) if data else {}
         except json.JSONDecodeError:
@@ -273,12 +383,14 @@ def _update_config(mutator: Callable[[dict], dict]) -> dict:
         new_cfg = mutator(dict(merged))
         if not isinstance(new_cfg, dict):
             new_cfg = dict(CONFIG_DEFAULTS)
-        handle.seek(0)
-        handle.truncate()
-        json.dump(new_cfg, handle)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+        payload = json.dumps(new_cfg) + "\n"
+        _atomic_write(CONFIG_FILE, payload, MAX_CONFIG_BYTES)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        except OSError:
+            pass
     return new_cfg
 
 
@@ -441,6 +553,7 @@ __all__ = [
     "toggle_workspace_id",
     "workspace_is_equalized",
     "acquire_watcher_lock",
+    "proc_start_time",
     "write_pid_record",
     "read_pid_record",
     "remove_pid_record",

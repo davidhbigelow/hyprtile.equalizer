@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 from _equalize_state import (
+    proc_start_time,
     read_pid_record,
     toggle_workspace_id,
 )
@@ -51,6 +52,7 @@ def watcher_is_running() -> bool:
         return False
     pid = record.get("pid")
     script = record.get("script")
+    expected_start = record.get("start")
     if not isinstance(pid, int) or not isinstance(script, str):
         return False
     cmdline_path = f"/proc/{pid}/cmdline"
@@ -60,15 +62,21 @@ def watcher_is_running() -> bool:
     except OSError:
         return False
     target = os.path.realpath(script)
+    matched = False
     for entry in data.split(b"\0"):
         if not entry:
             continue
         try:
             if os.path.realpath(entry.decode()) == target:
-                return True
+                matched = True
+                break
         except (UnicodeDecodeError, OSError):
             continue
-    return False
+    if not matched:
+        return False
+    if expected_start is not None and proc_start_time(pid) != expected_start:
+        return False
+    return True
 
 
 def ensure_watcher_running() -> None:

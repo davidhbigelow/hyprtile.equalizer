@@ -2,6 +2,7 @@
 
 import argparse
 import atexit
+from collections import deque
 import json
 import math
 import os
@@ -20,6 +21,7 @@ from _equalize_state import (
     clear_workspace_ids,
     get_config_choice,
     load_workspace_ids,
+    proc_start_time,
     read_pid_record,
     remove_pid_record,
     write_pid_record,
@@ -87,7 +89,7 @@ def hyprctl_json(args):
         return {}
 
 
-def process_matches(pid, script_path):
+def process_matches(pid, script_path, expected_start=None):
     cmdline_path = f"/proc/{pid}/cmdline"
     try:
         with open(cmdline_path, "rb") as handle:
@@ -95,6 +97,7 @@ def process_matches(pid, script_path):
     except OSError:
         return False
     real_script = os.path.realpath(script_path)
+    matched = False
     for entry in data.split(b"\0"):
         if not entry:
             continue
@@ -103,8 +106,16 @@ def process_matches(pid, script_path):
         except (UnicodeDecodeError, OSError):
             continue
         if candidate == real_script:
-            return True
-    return False
+            matched = True
+            break
+    if not matched:
+        return False
+    if expected_start is not None:
+        # The recorded process incarnation is verified against the live start
+        # time, closing the PID-reuse race definitively.
+        if proc_start_time(pid) != expected_start:
+            return False
+    return True
 
 
 def stop_existing(timeout=5.0):
@@ -113,10 +124,11 @@ def stop_existing(timeout=5.0):
         return False
     pid = record.get("pid")
     script_path = record.get("script")
+    expected_start = record.get("start")
     if not isinstance(pid, int) or not isinstance(script_path, str):
         remove_pid_record()
         return False
-    if not process_matches(pid, script_path):
+    if not process_matches(pid, script_path, expected_start):
         remove_pid_record()
         return False
     try:
@@ -126,7 +138,7 @@ def stop_existing(timeout=5.0):
         return False
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not process_matches(pid, script_path):
+        if not process_matches(pid, script_path, expected_start):
             remove_pid_record()
             return True
         time.sleep(0.1)
@@ -137,6 +149,7 @@ STABLE = 0.5         # seconds a deviation must persist before re-fitting
 GRACE = 1.0          # suppress detection immediately after we apply
 MOVE_THRESHOLD = 40  # logical px a float must deviate from its cell to matter
 EVENT_DEBOUNCE = 0.3  # settle delay after an event-triggered layout change
+MAX_EVENT_LINES_PER_TICK = 128  # bound on socket events handled per loop tick
 
 
 def read_layout_opts():
@@ -165,6 +178,54 @@ def read_layout_opts():
 GAPS_IN, GAPS_OUT, BORDER = read_layout_opts()
 
 
+_ADDRESS_TOKEN_RE = re.compile(r'"address:([^"]*)"')
+_NUM_TOKEN_RE = re.compile(r"\b(x|y|w|h)\s*=\s*(-?\d+)\b")
+_DISPATCH_SHAPE_RE = re.compile(
+    r"hl\.dsp\.window\.(float|resize|move)"
+    r"\(\{ window = \"address:0x[0-9a-f]+\""
+    r"(?:, (?:x|y|w|h) = -?\d+)*"
+    r"(?:, action = \"(?:enable|disable)\"){0,1}"
+    r"(?:, relative = (?:true|false)){0,1}"
+    r" \}\)"
+)
+
+
+def _validate_dispatch(cmd):
+    """Enforce a strict allowlist shape before any command reaches Hyprland.
+
+    Every `"address:..."` token must be a bare hex window id and every
+    geometry value (x/y/w/h) must be an integer literal, and the whole command
+    must match the narrow `hl.dsp.window.<verb>({ ... })` grammar. This is the
+    single enforcement point for strict address/coordinate validation so an
+    unexpected value from an IPC event, snapshot, or config can never inject
+    into a Hyprland command string. Returns the validated command, or None if
+    unsafe.
+    """
+    if not isinstance(cmd, str) or not cmd:
+        return None
+    # Validate and normalize every window address token.
+    def _repl(match):
+        addr = match.group(1)
+        if not ADDRESS_RE.fullmatch(addr):
+            raise ValueError(addr)
+        return '"address:' + addr.lower() + '"'
+
+    try:
+        cmd = _ADDRESS_TOKEN_RE.sub(_repl, cmd)
+    except ValueError:
+        return None
+    # Ensure any present x/y/w/h values are plain integers (no expressions).
+    for token in _NUM_TOKEN_RE.finditer(cmd):
+        try:
+            int(token.group(2))
+        except ValueError:
+            return None
+    # Whole-command grammar allowlist.
+    if not _DISPATCH_SHAPE_RE.fullmatch(cmd):
+        return None
+    return cmd
+
+
 def dispatch(cmd):
     """Send a dispatch straight to the Hyprland IPC socket.
 
@@ -173,6 +234,12 @@ def dispatch(cmd):
     the toggle-off sequence. Falls back to a `hyprctl` subprocess if the socket
     is unavailable.
     """
+    validated = _validate_dispatch(cmd)
+    if validated is None:
+        if os.environ.get("EQUALIZE_DEBUG_SEND"):
+            print(f"DISPATCH-REJECTED {cmd!r}", file=sys.stderr, flush=True)
+        return
+    cmd = validated
     try:
         if os.environ.get("EQUALIZE_DEBUG_SEND"):
             print(f"DISPATCH {cmd}", file=sys.stderr, flush=True)
@@ -865,6 +932,7 @@ def run_daemon():
     last_sizes = {}          # address -> (w, h) we last applied
     resized_seen = set()     # addresses we already pinned+refit for one size change
     grids = set()            # workspace ids currently gridded/preserved
+    pending_events = deque() # socket events awaiting processing (bounded per tick)
 
     def snap_sizes(mon, ws):
         return {
@@ -1000,7 +1068,8 @@ def run_daemon():
                 except Exception:
                     traceback.print_exc()
 
-            # 3) Read available socket events.
+            # 3) Read available socket events into the pending queue. Each
+            # recv is capped (16 KiB) and only ever appended to the queue.
             r, _, _ = select.select([sock], [], [], POLL)
             if sock in r:
                 try:
@@ -1009,36 +1078,45 @@ def run_daemon():
                     break
                 if not data:
                     break
-                for line in data.splitlines():
-                    mon, cur = monitor_and_ws()
-                    if mon is None:
-                        continue
-                    # If the active workspace changed to a newly equalized one that
-                    # isn't gridded yet, grid it. Desktops already gridded stay
-                    # preserved (we never released them on switch-away).
-                    grid_if_needed(cur)
-                    if cur in grids:
-                        # Ignore move/float events we just generated ourselves by
-                        # stretching a tile in place (see apply_fill_in_place).
-                        suppressed = time.monotonic() < fill_suppress_until
-                        if line.startswith("movewindowv2>>") and not suppressed:
-                            raw = line[len("movewindowv2>>"):].split(",")
-                            addr = normalize_address(raw[0]) if raw else None
-                            try:
-                                target_ws = int(raw[1]) if len(raw) > 1 else None
-                            except (IndexError, ValueError):
-                                target_ws = None
-                            if addr and target_ws is not None and target_ws != cur:
-                                # Left the grid for another desktop: tile normally there.
-                                dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
-                            pending_apply = (now + EVENT_DEBOUNCE, cur)
-                        elif line.startswith("movewindow>>") and not suppressed:
-                            addr = normalize_address(line[len("movewindow>>"):].split(",")[0])
-                            if addr:
-                                dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
-                            pending_apply = (now + EVENT_DEBOUNCE, cur)
-                        elif line.startswith(("openwindow>>", "closewindow>>", "changefloatingmode>>")) and not suppressed:
-                            pending_apply = (now + EVENT_DEBOUNCE, cur)
+                pending_events.extend(data.splitlines())
+
+            # 4) Drain at most MAX_EVENT_LINES_PER_TICK queued events this
+            # tick so a burst/flood of socket events can never make a single
+            # loop iteration perform unbounded work; any backlog simply
+            # carries over to the next tick.
+            processed_events = 0
+            while pending_events and processed_events < MAX_EVENT_LINES_PER_TICK:
+                line = pending_events.popleft()
+                processed_events += 1
+                mon, cur = monitor_and_ws()
+                if mon is None:
+                    continue
+                # If the active workspace changed to a newly equalized one that
+                # isn't gridded yet, grid it. Desktops already gridded stay
+                # preserved (we never released them on switch-away).
+                grid_if_needed(cur)
+                if cur in grids:
+                    # Ignore move/float events we just generated ourselves by
+                    # stretching a tile in place (see apply_fill_in_place).
+                    suppressed = time.monotonic() < fill_suppress_until
+                    if line.startswith("movewindowv2>>") and not suppressed:
+                        raw = line[len("movewindowv2>>"):].split(",")
+                        addr = normalize_address(raw[0]) if raw else None
+                        try:
+                            target_ws = int(raw[1]) if len(raw) > 1 else None
+                        except (IndexError, ValueError):
+                            target_ws = None
+                        if addr and target_ws is not None and target_ws != cur:
+                            # Left the grid for another desktop: tile normally there.
+                            dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
+                        pending_apply = (now + EVENT_DEBOUNCE, cur)
+                    elif line.startswith("movewindow>>") and not suppressed:
+                        addr = normalize_address(line[len("movewindow>>"):].split(",")[0])
+                        if addr:
+                            dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
+                        pending_apply = (now + EVENT_DEBOUNCE, cur)
+                    elif line.startswith(("openwindow>>", "closewindow>>", "changefloatingmode>>")) and not suppressed:
+                        pending_apply = (now + EVENT_DEBOUNCE, cur)
     finally:
         try:
             sock.close()
