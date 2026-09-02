@@ -79,33 +79,15 @@ else
 fi
 
 # (Re)start the watcher in the background, detached from this script's session.
-start_watcher() {
-  python3 - "$SCRIPTS_DIR/equalize-watch" <<'PY'
-import os, signal, subprocess, sys, time
-watch = sys.argv[1]
-self, ppid = os.getpid(), os.getppid()
-out = subprocess.run(["ps","-eo","pid,args"], capture_output=True, text=True).stdout
-for line in out.splitlines():
-    parts = line.split(None, 1)
-    if len(parts) < 2:
-        continue
-    try:
-        pid = int(parts[0])
-    except ValueError:
-        continue
-    if pid in (self, ppid):
-        continue
-    if "equalize-watch" in parts[1] and "python3" in parts[1]:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-time.sleep(0.5)
-subprocess.Popen([watch], start_new_session=True,
-                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                 stdin=subprocess.DEVNULL)
-PY
+stop_watcher() {
+  "$SCRIPTS_DIR/equalize-watch" --stop >/dev/null 2>&1 || true
 }
+
+start_watcher() {
+  nohup "$SCRIPTS_DIR/equalize-watch" >/dev/null 2>&1 &
+}
+
+stop_watcher
 if [[ -S "$HYPR_SOCKET" ]]; then
   start_watcher
   echo "  watcher restarted ($SCRIPTS_DIR/equalize-watch)."

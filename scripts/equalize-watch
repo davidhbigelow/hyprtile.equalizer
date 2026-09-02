@@ -1,13 +1,31 @@
 #!/usr/bin/env python3
 
+import argparse
+import atexit
+from collections import deque
 import json
 import math
 import os
+import re
 import select
+import signal
 import socket
 import subprocess
+import sys
 import time
 import traceback
+
+from _equalize_state import (
+    acquire_watcher_lock,
+    clear_snapshot,
+    clear_workspace_ids,
+    get_config_choice,
+    load_workspace_ids,
+    proc_start_time,
+    read_pid_record,
+    remove_pid_record,
+    write_pid_record,
+)
 
 SOCKET = os.path.join(
     os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"),
@@ -15,44 +33,129 @@ SOCKET = os.path.join(
     os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""),
     ".socket2.sock",
 )
-
-# Equalize is per-desktop: each desktop you press SUPER+E on is independently
-# equalized and preserved across switches. The set of equalized workspace ids
-# lives in this file (one per line), written by omarchy-equalize-toggle.
-SET_FILE = os.path.expanduser("~/.config/omarchy/equalize-desktops")
+IPC_SOCKET = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"),
+    "hypr",
+    os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""),
+    ".socket.sock",
+)
+SCRIPT_PATH = os.path.realpath(__file__)
 
 
 def load_wanted():
     """Set of workspace ids currently marked equalized."""
-    try:
-        with open(SET_FILE) as f:
-            return {int(x) for x in f.read().split() if x.strip().lstrip("-").isdigit()}
-    except OSError:
-        return set()
+    return load_workspace_ids()
 
 
 def reset_state():
     """Start each session fresh: no desktop is equalized until SUPER+E is pressed."""
     try:
-        os.makedirs(os.path.dirname(SET_FILE), exist_ok=True)
-        with open(SET_FILE, "w") as f:
-            f.write("")
+        clear_workspace_ids()
     except OSError:
         pass
+
+HYPRCTL_TIMEOUT = float(os.environ.get("EQUALIZE_HYPRCTL_TIMEOUT", "1.5"))
+HYPRCTL_MAX_OUTPUT = int(
+    os.environ.get("EQUALIZE_HYPRCTL_MAX_OUTPUT", str(512 * 1024))
+)
+ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]+$")
+LOCK_FD = None
+
+
+def normalize_address(value):
+    if isinstance(value, str):
+        token = value.strip()
+        if ADDRESS_RE.fullmatch(token):
+            return token.lower()
+    return None
+
+
+def hyprctl_json(args):
+    try:
+        proc = subprocess.run(
+            ["hyprctl", *args],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=HYPRCTL_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        return {}
+    if len(proc.stdout) > HYPRCTL_MAX_OUTPUT:
+        return {}
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+
+def process_matches(pid, script_path, expected_start=None):
+    cmdline_path = f"/proc/{pid}/cmdline"
+    try:
+        with open(cmdline_path, "rb") as handle:
+            data = handle.read(64 * 1024)
+    except OSError:
+        return False
+    real_script = os.path.realpath(script_path)
+    matched = False
+    for entry in data.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            candidate = os.path.realpath(entry.decode())
+        except (UnicodeDecodeError, OSError):
+            continue
+        if candidate == real_script:
+            matched = True
+            break
+    if not matched:
+        return False
+    if expected_start is not None:
+        # The recorded process incarnation is verified against the live start
+        # time, closing the PID-reuse race definitively.
+        if proc_start_time(pid) != expected_start:
+            return False
+    return True
+
+
+def stop_existing(timeout=5.0):
+    record = read_pid_record()
+    if not record:
+        return False
+    pid = record.get("pid")
+    script_path = record.get("script")
+    expected_start = record.get("start")
+    if not isinstance(pid, int) or not isinstance(script_path, str):
+        remove_pid_record()
+        return False
+    if not process_matches(pid, script_path, expected_start):
+        remove_pid_record()
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        remove_pid_record()
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_matches(pid, script_path, expected_start):
+            remove_pid_record()
+            return True
+        time.sleep(0.1)
+    return False
 
 POLL = 0.25          # seconds between position checks during idle
 STABLE = 0.5         # seconds a deviation must persist before re-fitting
 GRACE = 1.0          # suppress detection immediately after we apply
 MOVE_THRESHOLD = 40  # logical px a float must deviate from its cell to matter
 EVENT_DEBOUNCE = 0.3  # settle delay after an event-triggered layout change
+MAX_EVENT_LINES_PER_TICK = 128  # bound on socket events handled per loop tick
 
 
 def read_layout_opts():
     def _get(key):
-        try:
-            return json.loads(subprocess.check_output(["hyprctl", "getoption", "-j", key]))
-        except Exception:
-            return {}
+        data = hyprctl_json(["getoption", "-j", key])
+        return data if isinstance(data, dict) else {}
 
     gaps_in = 5
     gaps_out = 10
@@ -75,47 +178,168 @@ def read_layout_opts():
 GAPS_IN, GAPS_OUT, BORDER = read_layout_opts()
 
 
+_ADDRESS_TOKEN_RE = re.compile(r'"address:([^"]*)"')
+_NUM_TOKEN_RE = re.compile(r"\b(x|y|w|h)\s*=\s*(-?\d+)\b")
+_DISPATCH_SHAPE_RE = re.compile(
+    r"hl\.dsp\.window\.(float|resize|move)"
+    r"\(\{ window = \"address:0x[0-9a-f]+\""
+    r"(?:, (?:x|y|w|h) = -?\d+)*"
+    r"(?:, action = \"(?:enable|disable)\"){0,1}"
+    r"(?:, relative = (?:true|false)){0,1}"
+    r" \}\)"
+)
+
+
+def _validate_dispatch(cmd):
+    """Enforce a strict allowlist shape before any command reaches Hyprland.
+
+    Every `"address:..."` token must be a bare hex window id and every
+    geometry value (x/y/w/h) must be an integer literal, and the whole command
+    must match the narrow `hl.dsp.window.<verb>({ ... })` grammar. This is the
+    single enforcement point for strict address/coordinate validation so an
+    unexpected value from an IPC event, snapshot, or config can never inject
+    into a Hyprland command string. Returns the validated command, or None if
+    unsafe.
+    """
+    if not isinstance(cmd, str) or not cmd:
+        return None
+    # Validate and normalize every window address token.
+    def _repl(match):
+        addr = match.group(1)
+        if not ADDRESS_RE.fullmatch(addr):
+            raise ValueError(addr)
+        return '"address:' + addr.lower() + '"'
+
+    try:
+        cmd = _ADDRESS_TOKEN_RE.sub(_repl, cmd)
+    except ValueError:
+        return None
+    # Ensure any present x/y/w/h values are plain integers (no expressions).
+    for token in _NUM_TOKEN_RE.finditer(cmd):
+        try:
+            int(token.group(2))
+        except ValueError:
+            return None
+    # Whole-command grammar allowlist.
+    if not _DISPATCH_SHAPE_RE.fullmatch(cmd):
+        return None
+    return cmd
+
+
 def dispatch(cmd):
-    subprocess.run(
-        ["hyprctl", "dispatch", cmd],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    """Send a dispatch straight to the Hyprland IPC socket.
 
-
-def hyprctl_json(args):
-    return json.loads(subprocess.check_output(["hyprctl"] + args))
+    Spawning `hyprctl` costs ~5ms per call; the raw socket is ~0.1ms. The
+    ordered restore sends one command per window, so this shaves real time off
+    the toggle-off sequence. Falls back to a `hyprctl` subprocess if the socket
+    is unavailable.
+    """
+    validated = _validate_dispatch(cmd)
+    if validated is None:
+        if os.environ.get("EQUALIZE_DEBUG_SEND"):
+            print(f"DISPATCH-REJECTED {cmd!r}", file=sys.stderr, flush=True)
+        return
+    cmd = validated
+    try:
+        if os.environ.get("EQUALIZE_DEBUG_SEND"):
+            print(f"DISPATCH {cmd}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    try:
+        if IPC_SOCKET and os.path.exists(IPC_SOCKET):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(HYPRCTL_TIMEOUT)
+                s.connect(IPC_SOCKET)
+                s.sendall(("dispatch " + cmd + "\n").encode())
+                while s.recv(65536):
+                    pass
+            return
+    except (OSError, socket.timeout):
+        pass
+    try:
+        subprocess.run(
+            ["hyprctl", "dispatch", cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=HYPRCTL_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        pass
 
 
 def monitor_and_ws():
-    mon = None
-    for m in hyprctl_json(["monitors", "-j"]):
-        if m.get("focused"):
-            mon = m
-            break
+    monitors = hyprctl_json(["monitors", "-j"])
+    if not isinstance(monitors, list):
+        return None, None
+    mon = next((m for m in monitors if isinstance(m, dict) and m.get("focused")), None)
     if mon is None:
         return None, None
-    ws = hyprctl_json(["activeworkspace", "-j"]).get("id")
+    ws_payload = hyprctl_json(["activeworkspace", "-j"])
+    ws = ws_payload.get("id") if isinstance(ws_payload, dict) else None
     return mon, ws
 
 
 def current_rows(mon, ws):
     wins = hyprctl_json(["clients", "-j"])
-    return [
-        w
-        for w in wins
-        if w.get("workspace", {}).get("id") == ws
-        and w.get("mapped")
-        and not w.get("hidden")
-        and not w.get("fullscreen")
-    ]
+    rows = []
+    if not isinstance(wins, list):
+        return rows
+    for w in wins:
+        if not isinstance(w, dict):
+            continue
+        addr = normalize_address(w.get("address"))
+        if not addr:
+            continue
+        workspace = w.get("workspace", {}) or {}
+        if workspace.get("id") != ws:
+            continue
+        if not (w.get("mapped") and not w.get("hidden") and not w.get("fullscreen")):
+            continue
+        row = dict(w)
+        row["address"] = addr
+        rows.append(row)
+    return rows
 
 
 def focused_address():
+    payload = hyprctl_json(["activewindow", "-j"])
+    if isinstance(payload, dict):
+        return normalize_address(payload.get("address"))
+    return None
+
+
+def cursor_window(mon, ws):
+    """Address of the frontmost managed window on `ws` under the cursor.
+
+    Reads `hyprctl cursorpos` (logical coordinates); among windows whose rect
+    contains the point, the one with the highest focusHistoryID is the
+    frontmost. Returns None when the cursor sits over no managed window.
+    """
     try:
-        return hyprctl_json(["activewindow", "-j"]).get("address")
-    except Exception:
+        proc = subprocess.run(
+            ["hyprctl", "cursorpos"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=HYPRCTL_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
         return None
+    try:
+        cx, cy = (int(v) for v in proc.stdout.strip().split(","))
+    except (ValueError, AttributeError):
+        return None
+    best, best_hist = None, -1
+    for w in current_rows(mon, ws):
+        x, y = w["at"]
+        ww, hh = w["size"]
+        if x <= cx <= x + ww and y <= cy <= y + hh:
+            hist = int(w.get("focusHistoryID", -1) or -1)
+            if hist > best_hist:
+                best_hist = hist
+                best = w["address"]
+    return best
 
 
 def geometry(mon):
@@ -181,13 +405,17 @@ def cell_list(mon, ws):
     return cells
 
 
-def nearest_layout(mon, ws, prio_order=None):
+def nearest_layout(mon, ws, prio_order=None, force_first_addr=None):
     """Assign each window to a distinct cell, honoring drop position.
 
     prio_order is a list of addresses (the windows the user just moved).
     Those are assigned to the cell nearest their current position first
     (so a dropped window keeps its drop cell), then the remaining windows
     fill the leftover cells by nearest distance.
+
+    force_first_addr, when given, claims the first (top-left) cell for that
+    window before anything else -- used on the initial equalize so the window
+    under the cursor anchors the grid while everyone else lays out normally.
 
     Returns (targets, applied) where targets is a list of
     (address, x, y, w, h) and applied maps address -> cell index.
@@ -202,6 +430,10 @@ def nearest_layout(mon, ws, prio_order=None):
     index_of = {r["address"]: i for i, r in enumerate(rows)}
     cells_rem = set(range(n))
     assignment = {}
+
+    if force_first_addr is not None and force_first_addr in index_of:
+        assignment[index_of[force_first_addr]] = 0
+        cells_rem.discard(0)
 
     def nearest_unused_cell(cx, cy):
         best, bd = None, float("inf")
@@ -223,8 +455,9 @@ def nearest_layout(mon, ws, prio_order=None):
 
     # 1) Priority (dragged) windows claim their nearest cell first.
     for addr in prio_order:
-        if addr in index_of:
-            pick(index_of[addr])
+        idx = index_of.get(addr)
+        if idx is not None and idx not in assignment:
+            pick(idx)
     # 2) Remaining windows fill leftover cells by nearest distance (greedy).
     remaining = [i for i in range(n) if i not in assignment]
     centers = [
@@ -255,17 +488,155 @@ def nearest_layout(mon, ws, prio_order=None):
     return targets, applied
 
 
-def apply_grid(mon, ws, prio_order=None):
-    """Float + equalize all managed windows. Returns (applied_map, sizes)."""
-    targets, applied = nearest_layout(mon, ws, prio_order)
+def fill_target_cell(mon, ws, fill_dir):
+    """Cell index of the tile that `fill_dir` stretches, or None when not applicable.
+
+    horizontal -> the last cell (bottom-right; stretched rightward to row end).
+    vertical   -> the cell directly above the empty bottom-right corner
+                  (stretched downward to the work area bottom).
+    Both require a partial last row (n % cols != 0) and at least two windows.
+    """
+    if fill_dir in (None, "off"):
+        return None
+    cells = cell_list(mon, ws)
+    n = len(cells)
+    if n < 2 or n % math.ceil(math.sqrt(n)) == 0:
+        return None
+    cols = max(1, math.ceil(math.sqrt(n)))
+    if fill_dir == "horizontal":
+        return n - 1
+    rows_n = math.ceil(n / cols)
+    idx = (rows_n - 2) * cols + (cols - 1)
+    return idx if 0 <= idx < n else None
+
+
+def extend_last_cell(mon, targets, applied, fill_dir):
+    if fill_dir in (None, "off") or len(targets) < 2 or not applied:
+        return targets
+    n = len(targets)
+    cols = max(1, math.ceil(math.sqrt(n)))
+    if n % cols == 0:
+        return targets
+    rows_n = math.ceil(n / cols)
+    g = geometry(mon)
+    pad = GAPS_OUT + BORDER
+    rx = g["l"] + pad
+    ry = g["t"] + pad
+    rw = g["w"] - 2 * pad
+    rh = g["h"] - 2 * pad
+
+    if fill_dir == "vertical":
+        target_cell = (rows_n - 2) * cols + (cols - 1)
+        if not (0 <= target_cell < n):
+            return targets
+        addr = next((a for a, c in applied.items() if c == target_cell), None)
+        if addr is None:
+            return targets
+        ti = next((i for i, (a2, *_r) in enumerate(targets) if a2 == addr), None)
+        if ti is None:
+            return targets
+        a2, x, y, w, h = targets[ti]
+        new_h = int(round((ry + rh) - y))
+        if new_h > h:
+            targets[ti] = (a2, x, y, w, new_h)
+        return targets
+
+    # horizontal (legacy default)
+    last_cell = max(applied.values(), default=None)
+    if last_cell is None or last_cell // cols != rows_n - 1:
+        return targets
+    target_idx = None
+    for i, (addr, *_rest) in enumerate(targets):
+        if applied.get(addr) == last_cell:
+            target_idx = i
+            break
+    if target_idx is None:
+        return targets
+    row_end = rx + rw
+    addr, x, y, w, h = targets[target_idx]
+    new_w = int(round(row_end - x))
+    if new_w > w:
+        targets[target_idx] = (addr, x, y, new_w, h)
+    return targets
+
+
+def apply_fill_in_place(mon, ws, fill_dir, current_rects, cell_map, stretch_state):
+    """Adjust only the stretched tile(s) when the fill direction changes.
+
+    `stretch_state` is the previous (addr, dir) we stretched, or (None, None).
+    Returns (updated_rects, new_stretch_state).
+    """
+    cells = cell_list(mon, ws)
+    n = len(cells)
+    g = geometry(mon)
+    pad = GAPS_OUT + BORDER
+    row_end = g["l"] + pad + (g["w"] - 2 * pad)
+    bottom = g["t"] + pad + (g["h"] - 2 * pad)
+
+    updated = dict(current_rects)
+    prev_addr, prev_dir = stretch_state
+
+    def natural_cell_for(addr):
+        idx = cell_map.get(addr)
+        if idx is None or idx >= len(cells):
+            return None
+        _, _, nx, ny, nw, nh = cells[idx]
+        return (nx, ny, nw, nh)
+
+    def restore_tile(addr):
+        nat = natural_cell_for(addr)
+        if nat is None:
+            return
+        nx, ny, nw, nh = nat
+        dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {nw}, y = {nh}, relative = false }})')
+        dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {nx}, y = {ny}, relative = false }})')
+        updated[addr] = (nx, ny, nw, nh)
+
+    # Restore the previously-stretched tile if it is no longer the target.
+    new_target_cell = fill_target_cell(mon, ws, fill_dir)
+    new_target_addr = None
+    if new_target_cell is not None:
+        new_target_addr = next((a for a, c in cell_map.items() if c == new_target_cell), None)
+
+    if prev_addr and (prev_addr != new_target_addr or fill_dir == "off"):
+        restore_tile(prev_addr)
+
+    if fill_dir == "off" or new_target_addr is None or new_target_cell is None:
+        return updated, (None, None)
+
+    # Stretch the new target tile in place.
+    _, _, tx, ty, tw, th = cells[new_target_cell]
+    ax, ay, aw, ah = updated.get(new_target_addr, (tx, ty, tw, th))
+    if fill_dir == "horizontal":
+        new_w = int(round(row_end - ax))
+        new_rect = (ax, ay, new_w, ah) if new_w > aw else (ax, ay, aw, ah)
+    else:  # vertical
+        new_h = int(round(bottom - ay))
+        new_rect = (ax, ay, aw, new_h) if new_h > ah else (ax, ay, aw, ah)
+
+    if new_rect != updated.get(new_target_addr):
+        nx, ny, nw, nh = new_rect
+        dispatch(f'hl.dsp.window.resize({{ window = "address:{new_target_addr}", x = {nw}, y = {nh}, relative = false }})')
+        dispatch(f'hl.dsp.window.move({{ window = "address:{new_target_addr}", x = {nx}, y = {ny}, relative = false }})')
+        updated[new_target_addr] = new_rect
+
+    return updated, (new_target_addr, fill_dir)
+
+
+def apply_grid(mon, ws, prio_order=None, fill_dir="off", force_first_addr=None):
+    """Float + equalize all managed windows. Returns (applied_map, sizes, rects)."""
+    targets, applied = nearest_layout(mon, ws, prio_order, force_first_addr)
+    targets = extend_last_cell(mon, targets, applied, fill_dir)
     sizes = {}
+    rects = {}
     for addr, x, y, w, h in targets:
         sizes[addr] = (w, h)
+        rects[addr] = (x, y, w, h)
         dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "enable" }})')
         # Resize first (center-anchored, shifts position), then move exactly.
         dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {w}, y = {h}, relative = false }})')
         dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {x}, y = {y}, relative = false }})')
-    return applied, sizes
+    return applied, sizes, rects
 
 
 def resize_fit_layout(mon, ws, pinned_addr):
@@ -431,11 +802,21 @@ def resize_fit_layout(mon, ws, pinned_addr):
     return targets, applied, (int(round(px)), int(round(py)), int(round(pw)), int(round(ph)))
 
 
-def apply_resize_fit(mon, ws, pinned_addr):
+def apply_resize_fit(mon, ws, pinned_addr, fill_dir="off"):
     targets, applied, pin_box = resize_fit_layout(mon, ws, pinned_addr)
     pin_x, pin_y, pin_w, pin_h = pin_box
-    sizes = {addr: (w, h) for addr, x, y, w, h in targets}
-    sizes[pinned_addr] = (pin_w, pin_h)
+    combined = list(targets) + [(pinned_addr, pin_x, pin_y, pin_w, pin_h)]
+    combined = extend_last_cell(mon, combined, applied, fill_dir)
+    targets = []
+    sizes = {}
+    rects = {}
+    for addr, x, y, w, h in combined:
+        rects[addr] = (x, y, w, h)
+        if addr == pinned_addr:
+            pin_x, pin_y, pin_w, pin_h = x, y, w, h
+        else:
+            targets.append((addr, x, y, w, h))
+        sizes[addr] = (w, h)
     # Keep the pinned (resized) window's new size (clamping only if it would
     # overflow the region) and move its box fully on-screen, since a
     # center-anchored resize can otherwise push its top-left off-region.
@@ -446,29 +827,28 @@ def apply_resize_fit(mon, ws, pinned_addr):
         dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "enable" }})')
         dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {w}, y = {h}, relative = false }})')
         dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {x}, y = {y}, relative = false }})')
-    return applied, sizes
+    return applied, sizes, rects
 
 
-def off_cells(mon, ws, applied):
-    """Addresses whose current nearest cell differs from the applied one."""
-    if not applied:
+def off_layout(mon, ws, expected):
+    """Addresses that drifted away from the last applied rectangle."""
+    if not expected:
         return set()
-    cells = cell_list(mon, ws)
     off = set()
     for w in current_rows(mon, ws):
         addr = w["address"]
-        if addr not in applied:
+        if addr not in expected:
             continue
-        cx = w["at"][0] + w["size"][0] / 2.0
-        cy = w["at"][1] + w["size"][1] / 2.0
-        nearest = 0
-        bd = float("inf")
-        for j, (ccx, ccy, *_rest) in enumerate(cells):
-            d = (cx - ccx) ** 2 + (cy - ccy) ** 2
-            if d < bd:
-                bd = d
-                nearest = j
-        if nearest != applied[addr]:
+        exp_x, exp_y, exp_w, exp_h = expected[addr]
+        act_x = int(w["at"][0])
+        act_y = int(w["at"][1])
+        act_w = int(w["size"][0])
+        act_h = int(w["size"][1])
+        dx = abs(act_x - exp_x)
+        dy = abs(act_y - exp_y)
+        dw = abs(act_w - exp_w)
+        dh = abs(act_h - exp_h)
+        if max(dx, dy, dw, dh) > MOVE_THRESHOLD:
             off.add(addr)
     return off
 
@@ -476,103 +856,83 @@ def off_cells(mon, ws, applied):
 def release_ws(ws):
     """De-float every window on a workspace so it returns to normal tiling."""
     wins = hyprctl_json(["clients", "-j"])
+    if not isinstance(wins, list):
+        return
     for w in wins:
+        if not isinstance(w, dict):
+            continue
+        addr = normalize_address(w.get("address"))
+        if not addr:
+            continue
         if (
             w.get("workspace", {}).get("id") == ws
             and w.get("mapped")
             and not w.get("hidden")
             and w.get("floating")
         ):
-            dispatch(f'hl.dsp.window.float({{ window = "address:{w["address"]}", action = "disable" }})')
+            dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
 
 
-def dominant_layout(mon, ws, active):
-    """Lay out the active window at ~2x a single tile's area, others at 1x.
+def _current_mapped(ws):
+    """Managed (mapped, visible, non-fullscreen) windows currently on `ws`."""
+    wins = hyprctl_json(["clients", "-j"])
+    rows = []
+    if not isinstance(wins, list):
+        return rows
+    for w in wins:
+        if not isinstance(w, dict):
+            continue
+        addr = normalize_address(w.get("address"))
+        if not addr:
+            continue
+        ws_id = (w.get("workspace") or {}).get("id")
+        if ws_id != ws:
+            continue
+        if not (w.get("mapped") and not w.get("hidden") and not w.get("fullscreen")):
+            continue
+        rows.append(w)
+    return rows
 
-    The active window spans two side-by-side grid cells (so it is twice as
-    wide, hence ~2x the area); every other window takes one cell. This is the
-    shape used just before the grid is released to normal tiling, so the
-    focused window re-tiles as the largest tile.
 
-    Returns {address: (x, y, w, h)}. Returns None if there is nothing to do.
+def restore_snapshot(ws):
+    """Toggle-OFF: release the grid back to Hyprland's native tiling.
+
+    De-floats every window on the workspace in one pass -- no ordering, no
+    reconstruction. Dwindle re-tiles the workspace naturally into its own layout.
+    (Hyprland exposes no split-tree API, so any attempt to recreate an arbitrary
+    pre-grid arrangement exactly is approximate at best; releasing natively is
+    fast, predictable, and never leaves windows stranded floating.) Any captured
+    snapshot is discarded.
     """
-    rows = current_rows(mon, ws)
-    addrs = [row["address"] for row in rows]
-    if not addrs or active not in addrs:
-        return None
-    g = geometry(mon)
-    pad = GAPS_OUT + BORDER
-    rx, ry = g["l"] + pad, g["t"] + pad
-    rw, rh = g["w"] - 2 * pad, g["h"] - 2 * pad
-    G = 18
-    n = len(addrs)
-    # Unit cells: the active one spans 2 cells, each other window 1 cell.
-    units = n + 1
-    cols = max(2, math.ceil(math.sqrt(units)))
-    rows_n = math.ceil(units / cols)
-    cw = (rw - G * (cols - 1)) / cols
-    ch = (rh - G * (rows_n - 1)) / rows_n
-    if cw < 1 or ch < 1:
-        return None
-
-    def pos(rr, cc):
-        return (rx + cc * (cw + G), ry + rr * (ch + G))
-
-    targets = {}
-    others = [a for a in addrs if a != active]
-    ax, ay = pos(0, 0)
-    targets[active] = (ax, ay, 2 * cw + G, ch)
-    used = {(0, 0), (0, 1)}
-    oi = 0
-    for rr in range(rows_n):
-        for cc in range(cols):
-            if (rr, cc) in used:
-                continue
-            if oi >= len(others):
-                break
-            x, y = pos(rr, cc)
-            targets[others[oi]] = (x, y, cw, ch)
-            oi += 1
-    return targets
-
-
-def apply_dominant(mon, ws, active):
-    """Float/resize/move the workspace into the dominant shape, then de-float."""
-    if mon is None:
-        release_ws(ws)
-        return
-    dom = dominant_layout(mon, ws, active)
-    if dom is None:
-        release_ws(ws)
-        return
-    for addr, (x, y, w, h) in dom.items():
-        dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "enable" }})')
-        dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {w}, y = {h}, relative = false }})')
-        dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {x}, y = {y}, relative = false }})')
+    clear_snapshot(ws)
     release_ws(ws)
 
 
-def main():
+def run_daemon():
     if not os.path.exists(SOCKET):
         return
     reset_state()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(SOCKET)
+    try:
+        sock.connect(SOCKET)
+    except OSError:
+        sock.close()
+        return
 
     now = time.monotonic()
+    fill_dir = get_config_choice("fill_remainder")
+    last_fill = fill_dir        # fill direction value we last acted on
+    stretch_state = (None, None)  # (addr, dir) of tile we last stretched in place
     last_apply = 0.0         # monotonic time we last applied a layout
     pending_apply = None     # (due_time, ws) queued event apply
+    fill_suppress_until = 0.0  # ignore our own fill-change events before this time
     off_state = (None, None)  # (off_seen frozenset, time first seen)
     current_map = {}         # address -> cell index of the layout we last applied
+    current_rects = {}       # address -> (x, y, w, h) we last applied
     last_sizes = {}          # address -> (w, h) we last applied
     resized_seen = set()     # addresses we already pinned+refit for one size change
     grids = set()            # workspace ids currently gridded/preserved
-    # In-memory, per-desktop record of the last organized layout:
-    #   ws -> {address: (x, y, w, h)}. Ephemeral only (never written to disk);
-    #   cleared when the watcher restarts. Lets SUPER+E toggle-OFF then back ON
-    #   on the same desktop reproduce the exact tile layout that was organized,
-    #   provided the set of tiles (windows) on that desktop has not changed.
-    remembered = {}
+    pending_events = deque() # socket events awaiting processing (bounded per tick)
 
     def snap_sizes(mon, ws):
         return {
@@ -580,155 +940,154 @@ def main():
             for w in current_rows(mon, ws)
         }
 
-    def reapply(mon, ws, prio=None):
+    def reapply(mon, ws, prio=None, force_first=None):
         """Apply the equal grid and refresh tracking. Returns the cell map."""
-        nonlocal last_sizes, resized_seen
-        m, s = apply_grid(mon, ws, prio)
+        nonlocal last_sizes, resized_seen, current_rects, stretch_state
+        m, s, rects = apply_grid(mon, ws, prio, fill_dir, force_first)
         last_sizes = s
+        current_rects = rects
         resized_seen = set()
-        remembered[ws] = {
-            w["address"]: (int(w["at"][0]), int(w["at"][1]),
-                           int(w["size"][0]), int(w["size"][1]))
-            for w in current_rows(mon, ws)
-        }
+        # The fresh grid already incorporates any stretch via extend_last_cell.
+        target_cell = fill_target_cell(mon, ws, fill_dir)
+        addr = next((a for a, c in m.items() if c == target_cell), None) if target_cell is not None else None
+        stretch_state = (addr, fill_dir) if addr else (None, None)
         return m
-
-    def restore_remembered(mon, ws):
-        """Re-apply the remembered layout for `ws` if the tile set is unchanged.
-
-        Matches the current set of managed windows against the recorded layout.
-        If the set is identical (no tiles added/removed) the exact recorded
-        (x, y, w, h) are re-applied and the nearest-cell map returned. If a tile
-        was added, removed, or replaced, returns None so a fresh grid is built.
-        """
-        prev = remembered.get(ws)
-        if not prev:
-            return None
-        rows = current_rows(mon, ws)
-        addrs = {w["address"] for w in rows}
-        if addrs != set(prev):
-            return None
-        cells = cell_list(mon, ws)
-        applied = {}
-        sizes = {}
-        for w in rows:
-            addr = w["address"]
-            x, y, ww, hh = prev[addr]
-            sizes[addr] = (ww, hh)
-            cx, cy = x + ww / 2.0, y + hh / 2.0
-            nearest, bd = 0, float("inf")
-            for j, (ccx, ccy, *_rest) in enumerate(cells):
-                d = (cx - ccx) ** 2 + (cy - ccy) ** 2
-                if d < bd:
-                    bd = d
-                    nearest = j
-            applied[addr] = nearest
-            dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "enable" }})')
-            dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {ww}, y = {hh}, relative = false }})')
-            dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {x}, y = {y}, relative = false }})')
-        return applied, sizes
 
     def grid_if_needed(ws):
         """Grid `ws` if it is marked equalized and not yet gridded. Returns mon."""
-        nonlocal current_map, last_sizes, resized_seen, last_apply
+        nonlocal current_map, last_sizes, resized_seen, last_apply, current_rects
         mon, cur = monitor_and_ws()
         if mon is None:
             return None
         wanted = load_wanted()
         if ws in wanted and ws not in grids:
-            restored = restore_remembered(mon, ws)
-            if restored is not None:
-                current_map, last_sizes = restored
-                resized_seen = set()
-            else:
-                current_map = reapply(mon, ws)
+            # The window under the cursor anchors the grid's top-left cell on
+            # the initial equalize; the rest settle into nearest cells as normal.
+            # Re-grids after drag/resize events deliberately do NOT use this.
+            current_map = reapply(mon, ws, force_first=cursor_window(mon, ws))
             grids.add(ws)
             last_apply = now
         return mon
 
-    while True:
-        now = time.monotonic()
-        wanted = load_wanted()
+    try:
+        while True:
+            fill_dir = get_config_choice("fill_remainder")
+            now = time.monotonic()
+            wanted = load_wanted()
 
-        # Release grids that are no longer marked equalized (toggle OFF).
-        for wid in list(grids):
-            if wid not in wanted:
-                mon, cur = monitor_and_ws()
-                # Make the active window the dominant (~2x) tile before release.
-                apply_dominant(mon, wid, focused_address())
-                grids.discard(wid)
-                current_map = {}
-                off_state = (None, None)
-
-        mon, cur = monitor_and_ws()
-        if mon is not None:
-            # Grid the active workspace if it is currently marked equalized.
-            grid_if_needed(cur)
-
-        # 1) Process any event-triggered (debounced) re-grid for the managed ws.
-        if pending_apply is not None:
-            due, wid = pending_apply
-            if now >= due:
-                mon, acur = monitor_and_ws()
-                if mon is not None and wid in grids:
-                    current_map = reapply(mon, wid)
-                    last_apply = now
-                pending_apply = None
-
-        # 2) Drag-drop / resize detection on the active gridded workspace.
-        if mon is not None and cur in grids and now - last_apply > GRACE:
-            try:
-                sizes_now = snap_sizes(mon, cur)
-                # 2a) A window was resized (SUPER +/-): pinch it and re-fit the
-                #     others to the leftover space. Only for the focused window.
-                foc = focused_address()
-                if (
-                    foc
-                    and foc in sizes_now
-                    and foc in last_sizes
-                    and foc not in resized_seen
-                ):
-                    w0, h0 = last_sizes[foc]
-                    w1, h1 = sizes_now[foc]
-                    if abs(w1 - w0) + abs(h1 - h0) >= 6:
-                        _, s = apply_resize_fit(mon, cur, foc)
-                        last_sizes = s
-                        resized_seen.add(foc)
-                        current_map = {}
-                        remembered[cur] = {
-                            w["address"]: (int(w["at"][0]), int(w["at"][1]),
-                                           int(w["size"][0]), int(w["size"][1]))
-                            for w in current_rows(mon, cur)
-                        }
+            # If the stretch direction changed while a grid is active, adjust the
+            # affected tile(s) in place instead of re-laying-out the whole grid.
+            if fill_dir != last_fill:
+                mon_f, cur_f = monitor_and_ws()
+                if mon_f is not None and cur_f in grids and current_rects:
+                    mon_f, cur_f = monitor_and_ws()
+                    try:
+                        if os.environ.get("EQUALIZE_DEBUG"):
+                            print(f"DBG fill change {last_fill}->{fill_dir} ws={cur_f} rects={len(current_rects)} cmap={len(current_map)} prev={stretch_state}", file=sys.stderr, flush=True)
+                        new_rects, stretch_state = apply_fill_in_place(
+                            mon_f, cur_f, fill_dir, current_rects, current_map, stretch_state
+                        )
+                        current_rects = new_rects
+                        # Refresh sizes snapshot so the resize detector does not
+                        # mistake our own stretch for a user resize and re-fit the
+                        # whole grid on top of it.
+                        last_sizes = {a: (r[2], r[3]) for a, r in new_rects.items()}
                         last_apply = now
                         off_state = (None, None)
-                        continue
-                # 2b) Drag-drop detection (a window moved to a different cell).
-                off = off_cells(mon, cur, current_map)
-                if off:
-                    seen, since = off_state
-                    if seen == off:
-                        if now - since >= STABLE:
-                            current_map = reapply(mon, cur, list(off))
+                        pending_apply = None
+                        fill_suppress_until = now + GRACE
+                    except Exception:
+                        traceback.print_exc()
+                last_fill = fill_dir
+
+            # Release grids that are no longer marked equalized (toggle OFF).
+            for wid in list(grids):
+                if wid not in wanted:
+                    # De-float every window (plain release) so the layout engine
+                    # re-tiles the workspace; consumes any captured snapshot.
+                    restore_snapshot(wid)
+                    grids.discard(wid)
+                    current_map = {}
+                    current_rects = {}
+                    stretch_state = (None, None)
+                    off_state = (None, None)
+
+            mon, cur = monitor_and_ws()
+            if mon is not None:
+                # Grid the active workspace if it is currently marked equalized.
+                grid_if_needed(cur)
+
+            # 1) Process any event-triggered (debounced) re-grid for the managed ws.
+            if pending_apply is not None:
+                due, wid = pending_apply
+                if now >= due:
+                    mon, acur = monitor_and_ws()
+                    if mon is not None and wid in grids:
+                        current_map = reapply(mon, wid)
+                        last_apply = now
+                    pending_apply = None
+
+            # 2) Drag-drop / resize detection on the active gridded workspace.
+            if mon is not None and cur in grids and now - last_apply > GRACE:
+                try:
+                    sizes_now = snap_sizes(mon, cur)
+                    # 2a) A window was resized (SUPER +/-): pinch it and re-fit the
+                    #     others to the leftover space. Only for the focused window.
+                    foc = focused_address()
+                    if (
+                        foc
+                        and foc in sizes_now
+                        and foc in last_sizes
+                        and foc not in resized_seen
+                    ):
+                        w0, h0 = last_sizes[foc]
+                        w1, h1 = sizes_now[foc]
+                        if abs(w1 - w0) + abs(h1 - h0) >= 6:
+                            _, s, rects = apply_resize_fit(mon, cur, foc, fill_dir)
+                            last_sizes = s
+                            current_rects = rects
+                            resized_seen.add(foc)
+                            current_map = {}
+                            stretch_state = (None, None)
                             last_apply = now
                             off_state = (None, None)
+                            continue
+                    # 2b) Drag-drop detection (a window moved to a different cell).
+                    off = off_layout(mon, cur, current_rects)
+                    if off:
+                        seen, since = off_state
+                        if seen == off:
+                            if now - since >= STABLE:
+                                current_map = reapply(mon, cur, list(off))
+                                last_apply = now
+                                off_state = (None, None)
+                        else:
+                            off_state = (off, now)
                     else:
-                        off_state = (off, now)
-                else:
-                    off_state = (None, None)
-            except Exception:
-                traceback.print_exc()
+                        off_state = (None, None)
+                except Exception:
+                    traceback.print_exc()
 
-        # 3) Read available socket events.
-        r, _, _ = select.select([sock], [], [], POLL)
-        if sock in r:
-            try:
-                data = sock.recv(16384).decode("utf-8", "ignore")
-            except OSError:
-                break
-            if not data:
-                break
-            for line in data.splitlines():
+            # 3) Read available socket events into the pending queue. Each
+            # recv is capped (16 KiB) and only ever appended to the queue.
+            r, _, _ = select.select([sock], [], [], POLL)
+            if sock in r:
+                try:
+                    data = sock.recv(16384).decode("utf-8", "ignore")
+                except OSError:
+                    break
+                if not data:
+                    break
+                pending_events.extend(data.splitlines())
+
+            # 4) Drain at most MAX_EVENT_LINES_PER_TICK queued events this
+            # tick so a burst/flood of socket events can never make a single
+            # loop iteration perform unbounded work; any backlog simply
+            # carries over to the next tick.
+            processed_events = 0
+            while pending_events and processed_events < MAX_EVENT_LINES_PER_TICK:
+                line = pending_events.popleft()
+                processed_events += 1
                 mon, cur = monitor_and_ws()
                 if mon is None:
                     continue
@@ -737,23 +1096,88 @@ def main():
                 # preserved (we never released them on switch-away).
                 grid_if_needed(cur)
                 if cur in grids:
-                    if line.startswith("movewindowv2>>"):
-                        addr = line[len("movewindowv2>>"):].split(",")[0]
+                    # Ignore move/float events we just generated ourselves by
+                    # stretching a tile in place (see apply_fill_in_place).
+                    suppressed = time.monotonic() < fill_suppress_until
+                    if line.startswith("movewindowv2>>") and not suppressed:
+                        raw = line[len("movewindowv2>>"):].split(",")
+                        addr = normalize_address(raw[0]) if raw else None
                         try:
-                            target_ws = int(line[len("movewindowv2>>"):].split(",")[1])
+                            target_ws = int(raw[1]) if len(raw) > 1 else None
                         except (IndexError, ValueError):
                             target_ws = None
-                        if target_ws is not None and target_ws != cur:
+                        if addr and target_ws is not None and target_ws != cur:
                             # Left the grid for another desktop: tile normally there.
                             dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
                         pending_apply = (now + EVENT_DEBOUNCE, cur)
-                    elif line.startswith("movewindow>>"):
-                        addr = line[len("movewindow>>"):].split(",")[0]
-                        dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
+                    elif line.startswith("movewindow>>") and not suppressed:
+                        addr = normalize_address(line[len("movewindow>>"):].split(",")[0])
+                        if addr:
+                            dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
                         pending_apply = (now + EVENT_DEBOUNCE, cur)
-                    elif line.startswith(("openwindow>>", "closewindow>>", "changefloatingmode>>")):
+                    elif line.startswith(("openwindow>>", "closewindow>>", "changefloatingmode>>")) and not suppressed:
                         pending_apply = (now + EVENT_DEBOUNCE, cur)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="HyprTile equalizer watcher")
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="terminate the currently running watcher instance",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.stop:
+        stopped = stop_existing()
+        if stopped:
+            return 0
+        # Nothing to stop is not an error for management commands.
+        return 0
+
+    global LOCK_FD
+    try:
+        LOCK_FD = acquire_watcher_lock()
+    except BlockingIOError:
+        return 0
+
+    def cleanup():
+        global LOCK_FD
+        remove_pid_record()
+        if LOCK_FD is not None:
+            try:
+                os.close(LOCK_FD)
+            except OSError:
+                pass
+            LOCK_FD = None
+
+    atexit.register(cleanup)
+
+    def _handle_exit(signum, _frame):
+        cleanup()
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _handle_exit)
+        signal.signal(signal.SIGINT, _handle_exit)
+    except Exception:
+        pass
+
+    write_pid_record(os.getpid(), SCRIPT_PATH)
+    try:
+        run_daemon()
+    finally:
+        cleanup()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

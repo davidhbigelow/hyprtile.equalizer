@@ -24,6 +24,7 @@ fi
 ARCHIVE="$DIST/${PKG}-${VERSION}.tar.gz"
 FILES=(
   README.md
+  LICENSE
   manifest.json
   EqualizeToggle.qml
   install.sh
@@ -34,6 +35,8 @@ mkdir -p "$DIST"
 
 echo "Building $ARCHIVE"
 tar -czf "$ARCHIVE" \
+  --exclude="__pycache__" \
+  --exclude="*.pyc" \
   --transform "s|^|${PKG}/|" \
   -C "$ROOT" \
   "${FILES[@]}"
