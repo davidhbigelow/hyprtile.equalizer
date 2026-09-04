@@ -627,7 +627,6 @@ def apply_fill_in_place(mon, ws, fill_dir, current_rects, cell_map, stretch_stat
 def apply_grid(mon, ws, prio_order=None, fill_dir="off", force_first_addr=None):
     """Float + equalize all managed windows. Returns (applied_map, sizes, rects)."""
     targets, applied = nearest_layout(mon, ws, prio_order, force_first_addr)
-    targets = extend_last_cell(mon, targets, applied, fill_dir)
     sizes = {}
     rects = {}
     # Phase 1: float every window first.  Hyprland assigns each window a
@@ -644,6 +643,142 @@ def apply_grid(mon, ws, prio_order=None, fill_dir="off", force_first_addr=None):
     for addr, x, y, w, h in targets:
         dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {w}, y = {h}, relative = false }})')
         dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {x}, y = {y}, relative = false }})')
+    # Phase 3: some apps (e.g. Krita) enforce a minimum size that is larger
+    # than the equal cell.  Re-compute the grid so each column/row is at least
+    # as large as the largest window assigned to it, so the oversized windows
+    # stop overlapping their neighbours.
+    time.sleep(0.05)
+    applied, sizes, rects = _fit_min_sizes(mon, ws, targets, applied, sizes, rects)
+    # Phase 4: fill-stretch the last cell, then dispatch only what changed.
+    fitted = [(a, *(rects.get(a, (x, y, w, h)))) for a, x, y, w, h in targets]
+    stretched = extend_last_cell(mon, fitted, applied, fill_dir)
+    for addr, x, y, w, h in stretched:
+        px, py, pw, ph = rects.get(addr, (x, y, w, h))
+        if (px, py, pw, ph) != (x, y, w, h):
+            dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {w}, y = {h}, relative = false }})')
+            dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {x}, y = {y}, relative = false }})')
+            rects[addr] = (x, y, w, h)
+            sizes[addr] = (w, h)
+    return applied, sizes, rects
+
+
+def _fit_min_sizes(mon, ws, targets, applied, fallback_sizes, fallback_rects):
+    """Iteratively re-layout the grid so columns/rows grow to fit
+    min-size-constrained windows.
+
+    Each pass measures how far every window's ACTUAL size (what Hyprland
+    refused to shrink it below) exceeds its equal cell and grows those
+    columns/rows; flexible columns split the leftover.  Because shrinking one
+    column can surface a constraint in its neighbour, passes repeat until no
+    window overflows its cell, or a small iteration cap is reached.
+
+    Windows are measured against their target cell (not their current
+    position, which is unreliable after Hyprland clamps an oversized window),
+    so multiple constrained windows do not cascade position errors.
+
+    Returns (applied, sizes, rects).
+    """
+    g = geometry(mon)
+    n = len(targets)
+    if n <= 1:
+        return applied, fallback_sizes, fallback_rects
+
+    cols = max(1, math.ceil(math.sqrt(n)))
+    rows_n = math.ceil(n / cols)
+    G = 18
+    pad = GAPS_OUT + BORDER
+    rx = g["l"] + pad
+    ry = g["t"] + pad
+    rw = g["w"] - 2 * pad
+    rh = g["h"] - 2 * pad
+
+    base_rects = {a: (x, y, w, h) for a, x, y, w, h in targets}
+    cells = {}
+    for addr, x, y, w, h in targets:
+        cell = applied.get(addr)
+        if cell is not None:
+            cells[addr] = cell
+    if not cells:
+        return applied, fallback_sizes, fallback_rects
+
+    def actual_sizes():
+        out = {}
+        for ww in current_rows(mon, ws):
+            out[ww["address"]] = (int(ww["size"][0]), int(ww["size"][1]))
+        return out
+
+    def distribute(need, span, gap, count):
+        """Return (lefts, widths) that tile `span` exactly.  Slots whose need
+        exceeds the equal share keep it; flexible slots split the leftover.
+        If the needs alone overflow the span, everything scales down
+        proportionally so the layout still fits."""
+        total_gaps = gap * (count - 1)
+        available = span - total_gaps
+        base = available / count
+        if sum(need) >= available:
+            scale = available / sum(need) if sum(need) > 0 else 0
+            widths = [max(1, int(round(nd * scale))) for nd in need]
+        else:
+            fixed = [i for i in range(count) if need[i] > base]
+            fixed_total = sum(need[i] for i in fixed)
+            leftover = available - fixed_total
+            flex = [i for i in range(count) if i not in fixed]
+            each = leftover / len(flex) if flex else 0
+            widths = [
+                int(round(need[i])) if i in fixed else int(round(each))
+                for i in range(count)
+            ]
+        lefts = [0] * count
+        cur = 0
+        for i in range(count):
+            lefts[i] = cur
+            cur += widths[i] + gap
+        return lefts, widths
+
+    rects = dict(base_rects)
+    sizes = {a: (b[2], b[3]) for a, b in base_rects.items()}
+    for _ in range(6):
+        actual = actual_sizes()
+        col_need = [0.0] * cols
+        row_need = [0.0] * rows_n
+        any_excess = False
+        for addr, cell in cells.items():
+            c = cell % cols
+            r = cell // cols
+            w, h = base_rects[addr][2], base_rects[addr][3]
+            aw, ah = actual.get(addr, (w, h))
+            if aw > w + 4:
+                col_need[c] = max(col_need[c], aw)
+                any_excess = True
+            if ah > h + 4:
+                row_need[r] = max(row_need[r], ah)
+                any_excess = True
+        if not any_excess:
+            break
+        col_lefts, col_widths = distribute(col_need, rw, G, cols)
+        row_lefts, row_heights = distribute(row_need, rh, G, rows_n)
+        next_rects = {}
+        for addr, cell in cells.items():
+            c = cell % cols
+            r = cell // cols
+            nx, ny = rx + col_lefts[c], ry + row_lefts[r]
+            nw, nh = col_widths[c], row_heights[r]
+            next_rects[addr] = (nx, ny, nw, nh)
+        sizes = {a: (next_rects[a][2], next_rects[a][3]) for a in cells}
+        # Only dispatch windows whose rectangle actually changed, so later
+        # passes don't re-trigger a visible shuffle on settled tiles.
+        moved = False
+        for addr, (nx, ny, nw, nh) in next_rects.items():
+            if rects.get(addr) == (nx, ny, nw, nh):
+                continue
+            dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {nw}, y = {nh}, relative = false }})')
+            dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {nx}, y = {ny}, relative = false }})')
+            moved = True
+        rects = next_rects
+        if not moved:
+            continue
+        time.sleep(0.06)
+
     return applied, sizes, rects
 
 
