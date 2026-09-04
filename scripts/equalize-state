@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Report whether the active workspace is currently equalized."""
 
 import json
@@ -10,12 +10,13 @@ from _equalize_state import workspace_is_equalized
 
 HYPRCTL_TIMEOUT = float(os.environ.get("EQUALIZE_HYPRCTL_TIMEOUT", "1.5"))
 HYPRCTL_OUTPUT_LIMIT = 64 * 1024
+HYPRCTL = "/usr/bin/hyprctl"
 
 
 def active_workspace_id():
     try:
         proc = subprocess.run(
-            ["hyprctl", "activeworkspace", "-j"],
+            [HYPRCTL, "activeworkspace", "-j"],
             capture_output=True,
             text=True,
             check=True,

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Toggle equalize mode for the active workspace and print the new state."""
 
 import json
@@ -14,6 +14,10 @@ from _equalize_state import (
 
 HYPRCTL_TIMEOUT = float(os.environ.get("EQUALIZE_HYPRCTL_TIMEOUT", "1.5"))
 HYPRCTL_OUTPUT_LIMIT = 64 * 1024
+PYTHON = "/usr/bin/python3"
+HYPRCTL = "/usr/bin/hyprctl"
+SYSTEMD_RUN = "/usr/bin/systemd-run"
+WATCHER_UNIT = "hyprtile-equalize.service"
 
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -28,7 +32,7 @@ HYPR_SOCKET = os.path.join(
 def active_workspace_id():
     try:
         proc = subprocess.run(
-            ["hyprctl", "activeworkspace", "-j"],
+            [HYPRCTL, "activeworkspace", "-j"],
             capture_output=True,
             text=True,
             check=True,
@@ -87,15 +91,39 @@ def ensure_watcher_running() -> None:
     watcher = os.path.join(SCRIPT_DIR, "equalize-watch")
     if not os.path.exists(watcher):
         return
+    env = {
+        "HOME": os.path.expanduser("~"),
+        "PATH": "/usr/bin",
+        "XDG_RUNTIME_DIR": os.environ.get(
+            "XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"
+        ),
+    }
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if signature:
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = signature
     try:
-        subprocess.Popen(
-            [watcher],
+        subprocess.run(
+            [
+                SYSTEMD_RUN,
+                "--user",
+                f"--unit={WATCHER_UNIT}",
+                "--collect",
+                "--property=Type=exec",
+                "--property=TimeoutStopSec=5s",
+                "--setenv=HYPRLAND_INSTANCE_SIGNATURE",
+                "--setenv=XDG_RUNTIME_DIR",
+                "--setenv=PATH=/usr/bin",
+                PYTHON,
+                watcher,
+            ],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
+            check=False,
+            timeout=HYPRCTL_TIMEOUT,
+            env=env,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         pass
 
 
