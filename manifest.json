@@ -5,6 +5,7 @@
   "version": "1.1.2",
   "author": "David (Deuce) Bigelow",
   "description": "Toggle live window-equalize mode (SUPER+E grid)",
+  "license": "MIT",
   "kinds": [
     "bar-widget"
   ],

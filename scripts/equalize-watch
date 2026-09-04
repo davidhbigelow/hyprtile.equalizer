@@ -763,6 +763,23 @@ def resize_fit_layout(mon, ws, pinned_addr):
     xs, ws_ = col_geom()
     ys, hs_ = row_geom()
 
+    # Recompute integer left edges and derive widths from them to prevent
+    # ±1px overlap that independent rounding of position and size can cause.
+    xs_int = [int(round(x)) for x in xs]
+    ys_int = [int(round(y)) for y in ys]
+    ws_int = []
+    for c in range(cols):
+        if c + 1 < cols:
+            ws_int.append(xs_int[c + 1] - xs_int[c] - G)
+        else:
+            ws_int.append(int(round(rx + rw)) - xs_int[c])
+    hs_int = []
+    for r in range(rows_n):
+        if r + 1 < rows_n:
+            hs_int.append(ys_int[r + 1] - ys_int[r] - G)
+        else:
+            hs_int.append(int(round(ry + rh)) - ys_int[r])
+
     # Assign each (non-pin) window to the free slot nearest its center.
     cells = []
     for r in range(rows_n):
@@ -793,10 +810,10 @@ def resize_fit_layout(mon, ws, pinned_addr):
     targets = []
     applied = {}
     for i, (r, c) in assigned.items():
-        x = int(round(xs[c]))
-        y = int(round(ys[r]))
-        w = int(round(ws_[c]))
-        h = int(round(hs_[r]))
+        x = xs_int[c]
+        y = ys_int[r]
+        w = ws_int[c]
+        h = hs_int[r]
         targets.append((rows[i]["address"], x, y, w, h))
         applied[rows[i]["address"]] = (r, c)
     applied[pin["address"]] = (pr, pc)
