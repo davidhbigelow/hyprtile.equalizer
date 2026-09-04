@@ -98,6 +98,12 @@ A legacy `true`/`false` value resolves to `horizontal`/`off`.
 
 ---
 
+## License
+
+MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 David Bigelow.
+
+---
+
 ## Uninstall
 
 1. Remove the plugin directory:
