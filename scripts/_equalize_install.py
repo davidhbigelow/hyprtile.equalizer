@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import fcntl
+import ctypes
+import errno
 import os
 import pwd
 import re
@@ -23,6 +25,11 @@ UNIT = "hyprtile-equalize.service"
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
 LOCK_NAME = ".hyprtile.equalize.install.lock"
 SIGNATURE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+BLOCK_BEGIN = "-- BEGIN hyprtile.equalize managed block"
+BLOCK_END = "-- END hyprtile.equalize managed block"
+RENAME_NOREPLACE = 1
+RENAME_EXCHANGE = 2
+LIBC = ctypes.CDLL(None, use_errno=True)
 
 
 class InstallError(RuntimeError):
@@ -132,7 +139,48 @@ def read_original(dir_fd: int, name: str, uid: int) -> Original:
         os.close(fd)
 
 
-def atomic_write(dir_fd: int, name: str, data: bytes, mode: int) -> None:
+def renameat2(dir_fd: int, old: str, new: str, flags: int) -> None:
+    rename = getattr(LIBC, "renameat2", None)
+    if rename is None:
+        raise InstallError("renameat2 is required for race-safe configuration updates")
+    result = rename(
+        ctypes.c_int(dir_fd),
+        ctypes.c_char_p(os.fsencode(old)),
+        ctypes.c_int(dir_fd),
+        ctypes.c_char_p(os.fsencode(new)),
+        ctypes.c_uint(flags),
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), new)
+
+
+def restore_exchange(
+    dir_fd: int, tmp_name: str, name: str, installed: Original, uid: int
+) -> None:
+    """Undo an exchange without discarding a later edit of the destination."""
+    renameat2(dir_fd, tmp_name, name, RENAME_EXCHANGE)
+    try:
+        displaced = read_original(dir_fd, tmp_name, uid)
+    except Exception as exc:
+        renameat2(dir_fd, tmp_name, name, RENAME_EXCHANGE)
+        raise InstallError(f"could not safely restore {name}") from exc
+    if displaced == installed:
+        return
+    # A second editor replaced our installed version after the first exchange.
+    # Put that newer value back rather than overwriting it with the older one.
+    renameat2(dir_fd, tmp_name, name, RENAME_EXCHANGE)
+    raise InstallError(f"configuration changed again while restoring {name}")
+
+
+def atomic_write(
+    dir_fd: int,
+    name: str,
+    data: bytes,
+    mode: int,
+    uid: int,
+    expected: Original,
+) -> Original:
     if len(data) > MAX_CONFIG_BYTES:
         raise InstallError(f"refusing oversized config write: {name}")
     tmp_name = f".hyprtile.equalize.{secrets.token_hex(16)}.tmp"
@@ -149,8 +197,40 @@ def atomic_write(dir_fd: int, name: str, data: bytes, mode: int) -> None:
         os.fsync(fd)
         os.close(fd)
         fd = -1
-        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        installed = Original(True, data, mode & 0o777)
+        if expected.exists:
+            try:
+                renameat2(dir_fd, tmp_name, name, RENAME_EXCHANGE)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    raise InstallError(
+                        f"configuration disappeared concurrently; refusing to replace {name}"
+                    ) from exc
+                raise
+            try:
+                displaced = read_original(dir_fd, tmp_name, uid)
+                matches = displaced == expected
+            except Exception as exc:
+                restore_exchange(dir_fd, tmp_name, name, installed, uid)
+                raise InstallError(
+                    f"configuration changed concurrently; refusing to replace {name}"
+                ) from exc
+            if not matches:
+                restore_exchange(dir_fd, tmp_name, name, installed, uid)
+                raise InstallError(
+                    f"configuration changed concurrently; refusing to replace {name}"
+                )
+        else:
+            try:
+                renameat2(dir_fd, tmp_name, name, RENAME_NOREPLACE)
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    raise InstallError(
+                        f"configuration appeared concurrently; refusing to replace {name}"
+                    ) from exc
+                raise
         os.fsync(dir_fd)
+        return installed
     finally:
         if fd >= 0:
             os.close(fd)
@@ -160,15 +240,57 @@ def atomic_write(dir_fd: int, name: str, data: bytes, mode: int) -> None:
             pass
 
 
-def restore(dir_fd: int, name: str, original: Original) -> None:
+def atomic_remove(dir_fd: int, name: str, expected: Original, uid: int) -> None:
+    tmp_name = f".hyprtile.equalize.{secrets.token_hex(16)}.removed"
+    try:
+        renameat2(dir_fd, name, tmp_name, RENAME_NOREPLACE)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            raise InstallError(
+                f"configuration disappeared concurrently; refusing to remove {name}"
+            ) from exc
+        raise
+    try:
+        displaced = read_original(dir_fd, tmp_name, uid)
+        if displaced != expected:
+            try:
+                renameat2(dir_fd, tmp_name, name, RENAME_NOREPLACE)
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    raise InstallError(
+                        f"configuration changed again while restoring {name}; "
+                        f"the displaced version remains at {tmp_name}"
+                    ) from exc
+                raise
+            raise InstallError(
+                f"configuration changed concurrently; refusing to remove {name}"
+            )
+        os.unlink(tmp_name, dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    except InstallError:
+        raise
+    except Exception as exc:
+        raise InstallError(
+            f"could not verify removed configuration; displaced version remains at {tmp_name}"
+        ) from exc
+
+
+def restore(
+    dir_fd: int,
+    name: str,
+    original: Original,
+    installed: Original,
+    uid: int,
+) -> None:
+    current = read_original(dir_fd, name, uid)
+    if current == original:
+        return
+    if current != installed:
+        raise InstallError(f"configuration changed concurrently; refusing to roll back {name}")
     if original.exists:
-        atomic_write(dir_fd, name, original.data, original.mode)
+        atomic_write(dir_fd, name, original.data, original.mode, uid, installed)
     else:
-        try:
-            os.unlink(name, dir_fd=dir_fd)
-            os.fsync(dir_fd)
-        except FileNotFoundError:
-            pass
+        atomic_remove(dir_fd, name, installed, uid)
 
 
 def lua_quote(value: str) -> str:
@@ -177,21 +299,43 @@ def lua_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def replace_plugin_entry(data: bytes, needle: bytes, comment: str, line: str) -> bytes:
+def replace_plugin_entry(
+    data: bytes,
+    legacy_comments: tuple[str, ...],
+    managed_line_prefix: str,
+    managed_token: str,
+    comment: str,
+    line: str,
+) -> bytes:
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise InstallError("Hyprland configuration is not valid UTF-8") from exc
+    lines = text.splitlines()
     kept = []
-    for existing in text.splitlines():
-        encoded = existing.encode("utf-8")
-        if needle in encoded or existing.startswith("-- hyprtile.equalize:"):
+    index = 0
+    while index < len(lines):
+        existing = lines[index]
+        if existing == BLOCK_BEGIN:
+            try:
+                end = lines.index(BLOCK_END, index + 1)
+            except ValueError as exc:
+                raise InstallError("unterminated hyprtile.equalize managed block") from exc
+            index = end + 1
+            continue
+        if existing in legacy_comments:
+            index += 1
+            if index < len(lines):
+                candidate = lines[index]
+                if candidate.startswith(managed_line_prefix) and managed_token in candidate:
+                    index += 1
             continue
         kept.append(existing)
+        index += 1
     body = "\n".join(kept).rstrip("\n")
     if body:
         body += "\n"
-    body += f"\n{comment}\n{line}\n"
+    body += f"\n{BLOCK_BEGIN}\n{comment}\n{line}\n{BLOCK_END}\n"
     encoded = body.encode("utf-8")
     if len(encoded) > MAX_CONFIG_BYTES:
         raise InstallError("updated Hyprland configuration is too large")
@@ -293,19 +437,27 @@ def main() -> int:
         updates = {
             "bindings.lua": replace_plugin_entry(
                 originals["bindings.lua"].data,
-                b"equalize-toggle",
+                ("-- hyprtile.equalize: toggle live grid (SUPER + E)",),
+                'o.bind("SUPER + E", "Toggle live equalize mode", ',
+                "equalize-toggle",
                 "-- hyprtile.equalize: toggle live grid (SUPER + E)",
                 binding,
             ),
             "autostart.lua": replace_plugin_entry(
                 originals["autostart.lua"].data,
-                b"equalize-watch",
+                (
+                    "-- hyprtile.equalize: live grid watcher",
+                    "-- hyprtile.equalize: supervised live grid watcher",
+                ),
+                "o.exec_on_start(",
+                "equalize-watch",
                 "-- hyprtile.equalize: supervised live grid watcher",
                 autostart,
             ),
         }
 
         changed = []
+        installed = {}
         signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
         if signature and not SIGNATURE_RE.fullmatch(signature):
             raise InstallError("invalid HYPRLAND_INSTANCE_SIGNATURE")
@@ -318,7 +470,9 @@ def main() -> int:
                 if original.exists and original.data == data:
                     continue
                 changed.append(name)
-                atomic_write(hypr_fd, name, data, original.mode if original.exists else 0o600)
+                mode = original.mode if original.exists else 0o600
+                installed[name] = Original(True, data, mode)
+                atomic_write(hypr_fd, name, data, mode, uid, original)
 
             if os.path.exists(hypr_socket):
                 run_checked([HYPRCTL, "reload"])
@@ -352,7 +506,7 @@ def main() -> int:
             rollback_errors = []
             for name in reversed(changed):
                 try:
-                    restore(hypr_fd, name, originals[name])
+                    restore(hypr_fd, name, originals[name], installed[name], uid)
                 except Exception as exc:
                     rollback_errors.append(f"restore {name}: {exc}")
             if os.path.exists(hypr_socket):
