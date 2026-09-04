@@ -1263,7 +1263,11 @@ def run_daemon():
                     # Ignore move/float events we just generated ourselves by
                     # stretching a tile in place (see apply_fill_in_place).
                     suppressed = time.monotonic() < fill_suppress_until
-                    if line.startswith("movewindowv2>>") and not suppressed:
+                    # Ignore move/float events from the apply we just ran; the
+                    # debounced re-apply they would schedule is what makes the
+                    # toggle look like a double refresh.
+                    self_applied = now - last_apply < GRACE
+                    if line.startswith("movewindowv2>>") and not suppressed and not self_applied:
                         raw = line[len("movewindowv2>>"):].split(",")
                         addr = normalize_address(raw[0]) if raw else None
                         try:
@@ -1274,12 +1278,14 @@ def run_daemon():
                             # Left the grid for another desktop: tile normally there.
                             dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
                         pending_apply = (now + EVENT_DEBOUNCE, cur)
-                    elif line.startswith("movewindow>>") and not suppressed:
+                    elif line.startswith("movewindow>>") and not suppressed and not self_applied:
                         addr = normalize_address(line[len("movewindow>>"):].split(",")[0])
                         if addr:
                             dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
                         pending_apply = (now + EVENT_DEBOUNCE, cur)
-                    elif line.startswith(("openwindow>>", "closewindow>>", "changefloatingmode>>")) and not suppressed:
+                    elif line.startswith(("openwindow>>", "closewindow>>")) and not suppressed:
+                        pending_apply = (now + EVENT_DEBOUNCE, cur)
+                    elif line.startswith("changefloatingmode>>") and not suppressed and not self_applied:
                         pending_apply = (now + EVENT_DEBOUNCE, cur)
     finally:
         try:
