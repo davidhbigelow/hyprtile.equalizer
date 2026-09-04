@@ -126,6 +126,15 @@ You can share that archive directly; the recipient only needs to unpack it into
 
 ## Changelog
 
+### 1.1.2
+- Installer-managed configuration now uses explicit begin/end markers. Only
+  those blocks and narrowly identified historical plugin blocks are replaced;
+  unrelated lines mentioning equalize helpers are preserved.
+- Existing files are atomically exchanged with the staged update, then the
+  displaced version is validated against the version originally read and
+  restored on mismatch. New-file creation is atomic and no-replace. Rollback
+  uses the same compare-and-exchange behavior, preserving concurrent edits.
+
 ### 1.1.1
 - Hardened the installer: all required tools use fixed trusted paths, plugin and
   configuration objects are checked for type and ownership, and configuration
