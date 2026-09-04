@@ -127,6 +127,14 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 David Bigelow.
 
 ## Changelog
 
+### 1.1.4
+- Hardened the Hyprland socket trust: the watcher now refuses to read or write
+  sockets that are not real, self-owned sockets resolving to the exact path
+  under the user's `XDG_RUNTIME_DIR`, and falls back to `hyprctl` if the
+  command socket fails the check.
+- Added [`SECURITY.md`](./SECURITY.md) documenting the trust model and the
+  input-validation, no-shell, and local-file hardening applied throughout.
+
 ### 1.1.3
 - Equalized grids now fit apps that refuse to shrink below a minimum size
   (e.g. Krita): columns and rows grow to fit them and flexible tiles split

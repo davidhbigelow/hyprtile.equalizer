@@ -10,6 +10,7 @@ import re
 import select
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -247,7 +248,7 @@ def dispatch(cmd):
     except Exception:
         pass
     try:
-        if IPC_SOCKET and os.path.exists(IPC_SOCKET):
+        if IPC_SOCKET and verify_socket_path(IPC_SOCKET, ".socket.sock"):
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                 s.settimeout(HYPRCTL_TIMEOUT)
                 s.connect(IPC_SOCKET)
@@ -1072,8 +1073,41 @@ def restore_snapshot(ws):
     release_ws(ws)
 
 
+def verify_socket_path(path, basename):
+    """Only trust a Hyprland socket that is really ours.
+
+    A process on the same machine could plant a socket or a symlink at the
+    expected path to feed us crafted events (event socket) or swallow our
+    dispatches (command socket). Before reading from or writing to it, require
+    that the path resolves, without any symlink, to the exact socket inside our
+    own XDG_RUNTIME_DIR, that it is a socket, and that we own it.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+        return False
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if not sig or not re.fullmatch(r"[A-Za-z0-9_]+", sig):
+        return False
+    runtime = os.path.realpath(
+        os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    )
+    expected_dir = os.path.join(runtime, "hypr", sig)
+    try:
+        dst = os.stat(expected_dir)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid():
+        return False
+    return os.path.realpath(path) == os.path.join(expected_dir, basename)
+
+
 def run_daemon():
-    if not os.path.exists(SOCKET):
+    if not verify_socket_path(SOCKET, ".socket2.sock"):
+        if os.environ.get("EQUALIZE_DEBUG"):
+            print(f"DBG refusing to read untrusted socket {SOCKET!r}", file=sys.stderr, flush=True)
         return
     reset_state()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
