@@ -52,15 +52,17 @@ tiling when you turn it off.
 ## Requirements
 - Hyprland with the `hl.dsp.*` dispatch helpers (0.44+ recommended).
 - Omarchy shell / Quickshell 1.6+ (any recent Omarchy build works).
-- `python3`, `bash`, and the `hyprctl` CLI in `PATH`.
+- Omarchy's standard `/usr/bin/python3`, `/usr/bin/hyprctl`, and systemd user
+  manager tools.
 
 ## Installation
 1. Copy this folder to `~/.config/omarchy/plugins/hyprtile.equalize/`. The
    plugin hot-reloads from this location; no omarchy command is required.
 2. Run `~/.config/omarchy/plugins/hyprtile.equalize/install.sh`.
    - Adds/updates the `SUPER+E` binding that calls `scripts/equalize-toggle`.
-   - Adds an autostart entry for the `scripts/equalize-watch` daemon.
-   - Reloads Hyprland (if running) and restarts the watcher in-place.
+   - Adds a systemd-supervised autostart entry for `scripts/equalize-watch`.
+   - Atomically reloads Hyprland (if running), rolls back on validation failure,
+     and restarts the supervised watcher.
 3. Add the widget to your bar if it did not show up automatically:
    `omarchy plugin enable hyprtile.equalize --section right --index end`.
 
@@ -123,6 +125,16 @@ You can share that archive directly; the recipient only needs to unpack it into
   code, run `omarchy restart shell`.
 
 ## Changelog
+
+### 1.1.1
+- Hardened the installer: all required tools use fixed trusted paths, plugin and
+  configuration objects are checked for type and ownership, and configuration
+  updates use no-follow descriptor-relative access under an exclusive lock.
+- Binding and autostart changes are atomically replaced and rolled back if
+  Hyprland reload or validation fails; rollback failures are reported.
+- Replaced the detached `nohup` watcher with a systemd-supervised transient user
+  service with a bounded stop timeout. Existing legacy autostart entries are
+  migrated automatically, and runtime fallback startup uses the same supervisor.
 
 ### 1.1.0
 - New: "Fill leftover space" is now a direction picker (`off` |

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Shared state helpers for HyprTile equalizer scripts.
 
 This module centralizes access to the private state directory, which keeps the
