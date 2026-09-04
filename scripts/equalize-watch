@@ -630,11 +630,18 @@ def apply_grid(mon, ws, prio_order=None, fill_dir="off", force_first_addr=None):
     targets = extend_last_cell(mon, targets, applied, fill_dir)
     sizes = {}
     rects = {}
+    # Phase 1: float every window first.  Hyprland assigns each window a
+    # default floating size on the transition; we need that to settle before
+    # issuing the precise resize/move, otherwise the resize can land on the
+    # pre-float geometry or be silently dropped.
     for addr, x, y, w, h in targets:
         sizes[addr] = (w, h)
         rects[addr] = (x, y, w, h)
         dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "enable" }})')
-        # Resize first (center-anchored, shifts position), then move exactly.
+    # Give Hyprland a beat to finish transitioning all windows to floating.
+    time.sleep(0.05)
+    # Phase 2: resize + move every window to its exact cell.
+    for addr, x, y, w, h in targets:
         dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {w}, y = {h}, relative = false }})')
         dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {x}, y = {y}, relative = false }})')
     return applied, sizes, rects
@@ -838,11 +845,15 @@ def apply_resize_fit(mon, ws, pinned_addr, fill_dir="off"):
     # Keep the pinned (resized) window's new size (clamping only if it would
     # overflow the region) and move its box fully on-screen, since a
     # center-anchored resize can otherwise push its top-left off-region.
+    # Phase 1: ensure every window is floating.
     dispatch(f'hl.dsp.window.float({{ window = "address:{pinned_addr}", action = "enable" }})')
+    for addr, x, y, w, h in targets:
+        dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "enable" }})')
+    time.sleep(0.05)
+    # Phase 2: resize + move to exact positions.
     dispatch(f'hl.dsp.window.resize({{ window = "address:{pinned_addr}", x = {pin_w}, y = {pin_h}, relative = false }})')
     dispatch(f'hl.dsp.window.move({{ window = "address:{pinned_addr}", x = {pin_x}, y = {pin_y}, relative = false }})')
     for addr, x, y, w, h in targets:
-        dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "enable" }})')
         dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {w}, y = {h}, relative = false }})')
         dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {x}, y = {y}, relative = false }})')
     return applied, sizes, rects
