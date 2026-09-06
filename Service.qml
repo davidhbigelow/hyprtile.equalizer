@@ -34,5 +34,5 @@ Item {
     onTriggered: root.maintain()
   }
 
-  Component.onDestroyed: root.teardown()
+  Component.onDestruction: root.teardown()
 }
