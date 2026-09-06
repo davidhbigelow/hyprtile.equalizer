@@ -1169,6 +1169,8 @@ def run_daemon():
 
     try:
         while True:
+            if not os.path.exists(SCRIPT_PATH):
+                break
             fill_dir = get_config_choice("fill_remainder")
             now = time.monotonic()
             wanted = load_wanted()

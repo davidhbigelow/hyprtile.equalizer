@@ -47,9 +47,10 @@ explicit argument list (`shell=False`), fixed absolute tool paths, a locked
 - State persists under `~/.local/state/hyprtile.equalizer/` in a private
   `0700` directory; reads and writes are opened with `O_NOFOLLOW`, writes go
   through a temp file plus atomic rename, and a lock guards concurrent access.
-- Installer writes are transactional: configuration edits are bounded by
-  explicit begin/end markers and replaced atomically (`RENAME_EXCHANGE`),
-  and the lifecycle unit is a transient user systemd service.
+- The `SUPER+E` binding is the plugin's only edit to the user's Hyprland
+  config. It lives inside `~/.config/hypr/bindings.lua` delimited by explicit
+  begin/end markers, is applied atomically with a temp-file rename, and is
+  removed when the plugin is disabled or removed.
 
 ## Reporting
 

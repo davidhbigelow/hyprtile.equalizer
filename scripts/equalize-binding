@@ -1,0 +1,208 @@
+#!/usr/bin/python3
+"""Manage the plugin's SUPER+E binding and legacy watch autostart entries.
+
+The plugin keeps its keybinding in `~/.config/hypr/bindings.lua` inside an
+explicit begin/end marker block. This module makes that block match the
+currently running plugin location, keeps Hyprland loadable, and rolls the
+binding back when the plugin is disabled. It also removes any stale watcher
+autostart entries written by pre-1.2 installers; the watcher is launched by
+the Omarchy shell service instead of at Hyprland login, so an autostart entry
+is no longer created.
+"""
+
+import argparse
+import os
+import stat as stat_module
+import subprocess
+import sys
+import tempfile
+
+HYPR_DIR = os.environ.get("EQUALIZE_HYPR_CONFIG_DIR") or os.path.join(
+    os.path.expanduser("~"), ".config", "hypr"
+)
+BINDINGS = os.path.join(HYPR_DIR, "bindings.lua")
+AUTOSTART = os.path.join(HYPR_DIR, "autostart.lua")
+
+BEGIN = "-- BEGIN hyprtile.equalize managed block"
+END = "-- END hyprtile.equalize managed block"
+BIND_TARGET = "SUPER + E"
+BIND_DESC = "Toggle live equalize mode"
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+TOGGLE = os.path.realpath(os.path.join(SCRIPT_DIR, "equalize-toggle"))
+
+HYPRCTL = "/usr/bin/hyprctl"
+RELOAD_TIMEOUT = 8.0
+MAX_CONFIG_BYTES = 2 * 1024 * 1024
+
+
+def _block() -> str:
+    command = f"/usr/bin/python3 {TOGGLE}"
+    return (
+        f"{BEGIN}\n"
+        f"-- hyprtile.equalize: toggle live grid (SUPER + E)\n"
+        f'o.bind("{BIND_TARGET}", "{BIND_DESC}", "{command}")\n'
+        f"{END}\n"
+    )
+
+
+def _open_read(path: str):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.open(path, flags)
+
+
+def _read_text(path: str) -> tuple:
+    """Return (content, mode) or (empty, mode) when the file is absent."""
+    try:
+        fd = _open_read(path)
+    except FileNotFoundError:
+        return "", 0o600
+    try:
+        st = os.fstat(fd)
+        mode = stat_module.S_IMODE(st.st_mode) or 0o600
+        with os.fdopen(fd, "rb") as handle:
+            raw = handle.read(MAX_CONFIG_BYTES + 1)
+    except OSError:
+        return "", 0o600
+    if len(raw) > MAX_CONFIG_BYTES:
+        return "", mode
+    return raw.decode("utf-8", "replace"), mode
+
+
+def _write_text(path: str, text: str, mode: int) -> None:
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, mode=0o755, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".equalize-bind-", text=True)
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp_path, mode)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            raise
+    except OSError:
+        pass
+
+
+def _settle(text: str, filekind: str, ensure_block: bool) -> str:
+    """Strip obsolete plugin entries; optionally place the current binding block."""
+    lines = text.splitlines(keepends=True)
+    out = []
+    inside = False
+    wrote_block = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == BEGIN:
+            inside = True
+            continue
+        if inside:
+            if stripped == END:
+                if ensure_block and not wrote_block:
+                    out.append(_block())
+                    wrote_block = True
+                inside = False
+            continue
+        if line.endswith("\n"):
+            body = line[:-1]
+        else:
+            body = line
+        if "hyprtile.equalize" in body or "hyprtile-equalize" in body:
+            continue
+        if filekind == "bindings" and "o.bind(" in body and ("equalize" in body or "hyprtile" in body):
+            continue
+        if filekind == "autostart" and "o.exec_on_start(" in body and (
+            "equalize-watch" in body or "hyprtile" in body
+        ):
+            continue
+        out.append(line)
+    if ensure_block and not wrote_block:
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        out.append(_block())
+    return "".join(out)
+
+
+def _changed(new_text: str, old_text: str) -> bool:
+    return new_text != old_text
+
+
+def _reload() -> None:
+    try:
+        subprocess.run(
+            [HYPRCTL, "reload"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=RELOAD_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _apply(path: str, filekind: str, ensure_block: bool) -> bool:
+    text, mode = _read_text(path)
+    if path == BINDINGS:
+        new_text = _settle(text, filekind, ensure_block)
+    else:
+        new_text = _settle(text, filekind, False)
+    if new_text == text:
+        return False
+    _write_text(path, new_text, mode)
+    return True
+
+
+def ensure() -> int:
+    bindings_changed = _apply(BINDINGS, "bindings", True)
+    autostart_changed = _apply(AUTOSTART, "autostart", False)
+    if bindings_changed or autostart_changed:
+        _reload()
+        print("updated")
+    else:
+        print("ok")
+    return 0
+
+
+def remove() -> int:
+    bindings_changed = _apply(BINDINGS, "bindings", False)
+    autostart_changed = _apply(AUTOSTART, "autostart", False)
+    if bindings_changed or autostart_changed:
+        _reload()
+        print("removed")
+    else:
+        print("clean")
+    return 0
+
+
+def status() -> int:
+    text, _mode = _read_text(BINDINGS)
+    print("managed" if _block() in text else "absent")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Manage the plugin's SUPER+E binding")
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("ensure", help="write or refresh the managed binding block")
+    sub.add_parser("remove", help="remove the managed binding block and watcher autostart entries")
+    sub.add_parser("status", help="report whether the managed binding block is present")
+    args = parser.parse_args()
+    if args.action == "ensure":
+        return ensure()
+    if args.action == "remove":
+        return remove()
+    if args.action == "status":
+        return status()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

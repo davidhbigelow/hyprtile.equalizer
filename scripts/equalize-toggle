@@ -16,8 +16,6 @@ HYPRCTL_TIMEOUT = float(os.environ.get("EQUALIZE_HYPRCTL_TIMEOUT", "1.5"))
 HYPRCTL_OUTPUT_LIMIT = 64 * 1024
 PYTHON = "/usr/bin/python3"
 HYPRCTL = "/usr/bin/hyprctl"
-SYSTEMD_RUN = "/usr/bin/systemd-run"
-WATCHER_UNIT = "hyprtile-equalize.service"
 
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -91,40 +89,20 @@ def ensure_watcher_running() -> None:
     watcher = os.path.join(SCRIPT_DIR, "equalize-watch")
     if not os.path.exists(watcher):
         return
-    env = {
-        "HOME": os.path.expanduser("~"),
-        "PATH": "/usr/bin",
-        "XDG_RUNTIME_DIR": os.environ.get(
-            "XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"
-        ),
-    }
-    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
-    if signature:
-        env["HYPRLAND_INSTANCE_SIGNATURE"] = signature
+    env = os.environ.copy()
+    env["PATH"] = "/usr/bin"
     try:
-        subprocess.run(
-            [
-                SYSTEMD_RUN,
-                "--user",
-                f"--unit={WATCHER_UNIT}",
-                "--collect",
-                "--property=Type=exec",
-                "--property=TimeoutStopSec=5s",
-                "--setenv=HYPRLAND_INSTANCE_SIGNATURE",
-                "--setenv=XDG_RUNTIME_DIR",
-                "--setenv=PATH=/usr/bin",
-                PYTHON,
-                watcher,
-            ],
+        subprocess.Popen(
+            [PYTHON, watcher],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=HYPRCTL_TIMEOUT,
+            start_new_session=True,
+            close_fds=True,
             env=env,
         )
-    except (OSError, subprocess.SubprocessError):
-        pass
+    except OSError:
+        return
 
 
 def main() -> int:

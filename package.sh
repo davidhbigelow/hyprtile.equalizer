@@ -27,7 +27,7 @@ FILES=(
   LICENSE
   manifest.json
   EqualizeToggle.qml
-  install.sh
+  Service.qml
   scripts
 )
 

@@ -19,30 +19,40 @@ again to return to normal Hyprland tiling.
 
 ## Install
 
-After the plugin is placed in `~/.config/omarchy/plugins/hyprtile.equalize/`:
+The standard Omarchy install from the plugin marketplace:
 
 ```bash
-~/.config/omarchy/plugins/hyprtile.equalize/install.sh
+omarchy plugin add https://github.com/davidhbigelow/hyprtile.equalizer.git --enable
 ```
 
-Then enable the bar widget:
+That clones the plugin, places its toolbar widget in the bar, and enables it.
+No installer script and no extra steps: enabling the plugin registers the
+`SUPER+E` binding, starts the layout watcher, and rolls both back when the
+plugin is disabled.
+
+You can place the widget in a specific section:
 
 ```bash
 omarchy plugin enable hyprtile.equalize --section right --index end
 ```
 
-The installer adds the `SUPER+E` binding, sets up a systemd-supervised
-autostart for the watcher, and reloads Hyprland. It rolls back automatically
-if anything fails.
+### How it manages itself
 
-### Re-adding after removal
+- The `SUPER+E` binding lives in `~/.config/hypr/bindings.lua` inside a
+  `-- BEGIN/END hyprtile.equalize managed block`. The plugin writes or updates
+  that block when enabled and removes it when disabled, so the binding always
+  matches the running plugin location and never leaves a dead shortcut behind.
+- The layout watcher is spawned by the Omarchy shell (the plugin declares a
+  `service` entry point). It stops when the Hyprland session ends, when the
+  plugin is disabled, or when the plugin is removed.
+- Disabling the plugin (`omarchy plugin disable hyprtile.equalize`) or removing
+  it always restores your `bindings.lua` to its previous contents.
 
-If you removed the plugin through the Omarchy plugin manager:
+### Troubleshooting
 
-1. Copy/clone the repo into `~/.config/omarchy/plugins/hyprtile.equalize/`.
-2. Run `~/.config/omarchy/plugins/hyprtile.equalize/install.sh`.
-3. `omarchy-shell shell rescanPlugins`
-4. `omarchy plugin enable hyprtile.equalize --section right --index end`
+- If the binding or watcher ever seems stale after a manual config edit, run
+  `scripts/equalize-binding ensure` from the plugin directory to re-sync, or
+  simply restart the shell: `omarchy restart shell`.
 
 ---
 
@@ -94,7 +104,7 @@ A legacy `true`/`false` value resolves to `horizontal`/`off`.
 
 - Hyprland 0.44+ with `hl.dsp.*` dispatch helpers.
 - Omarchy shell / Quickshell 1.6+ (any recent Omarchy build).
-- `/usr/bin/python3`, `/usr/bin/hyprctl`, systemd user manager.
+- `/usr/bin/python3` and `/usr/bin/hyprctl`.
 
 ---
 
@@ -104,28 +114,29 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 David Bigelow.
 
 ---
 
-## Uninstall
-
-1. Remove the plugin directory:
-   `rm -rf ~/.config/omarchy/plugins/hyprtile.equalize/`
-2. Delete the lines the installer appended to `hypr/bindings.lua` and
-   `hypr/autostart.lua`, or re-source your config with
-   `hyprctl reload`.
-
----
-
 ## Development
 
 - Run `scripts/equalize-watch` manually from a terminal to see tracebacks on
   stderr.
-- Hyprland config changes reload via `hyprctl reload`; the installer does
-  this automatically.
+- `scripts/equalize-binding` manages the binding lifecycle; inspect its state
+  with `scripts/equalize-binding status`.
+- Run the test suite with `python3 tests/test_equalize_binding.py`.
 - The shell plugin auto-reloads on save; if Quickshell caches old code, run
   `omarchy restart shell`.
 
 ---
 
 ## Changelog
+
+### 1.2.0
+- Marketplace-standard installation: the plugin is now added entirely with
+  `omarchy plugin add <repo>.git --enable`. The installer script and the
+  systemd-supervised watcher autostart are gone.
+- The plugin declares a `service` entry point: the Omarchy shell launches the
+  layout watcher when the plugin is enabled and stops it when it is disabled.
+- The `SUPER+E` binding is managed idempotently inside `bindings.lua` with
+  explicit markers and an atomic swap, replacing legacy entries from the old
+  installer on first run.
 
 ### 1.1.4
 - Hardened the Hyprland socket trust: the watcher now refuses to read or write
@@ -157,8 +168,8 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 David Bigelow.
 ### 1.1.1
 - Hardened installer: fixed trusted paths, type/ownership checks, atomic
   replace with rollback on Hyprland reload failure.
-- Replaced detached `nohup` watcher with a systemd-supervised transient
-  user service. Legacy autostart entries are migrated automatically.
+- Replaced a detached helper-spawn with a supervised lifecycle. Legacy
+  autostart entries are migrated automatically.
 
 ### 1.1.0
 - "Fill leftover space" is now a direction picker (`off` | `horizontal` |
