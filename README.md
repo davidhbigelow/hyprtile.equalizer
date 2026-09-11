@@ -128,6 +128,18 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 David Bigelow.
 
 ## Changelog
 
+### 1.2.2
+- Moving a window from an equalized workspace now re-balances the source
+  workspace and adapts the window to the target workspace's state.
+- Windows moved to native or newly-created workspaces are de-floated so
+  Hyprland tiles them normally instead of preserving their old equalized
+  geometry.
+- Windows moved into an already-equalized workspace are incorporated into its
+  grid, including when the active workspace changes before the move event is
+  processed.
+- Fixed Hyprland event-address parsing: bare hexadecimal addresses from the
+  event socket are now normalized to canonical `0x...` addresses.
+
 ### 1.2.1
 - Hardened the binding service against config-location attacks: the
   `SUPER+E` binding is now written through a descriptor-relative, owner-checked
