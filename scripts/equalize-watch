@@ -67,8 +67,10 @@ LOCK_FD = None
 def normalize_address(value):
     if isinstance(value, str):
         token = value.strip()
-        if ADDRESS_RE.fullmatch(token):
-            return token.lower()
+        if token.lower().startswith("0x"):
+            token = token[2:]
+        if token and re.fullmatch(r"[0-9a-fA-F]+", token):
+            return "0x" + token.lower()
     return None
 
 
@@ -1122,7 +1124,7 @@ def run_daemon():
     last_fill = fill_dir        # fill direction value we last acted on
     stretch_state = (None, None)  # (addr, dir) of tile we last stretched in place
     last_apply = 0.0         # monotonic time we last applied a layout
-    pending_apply = None     # (due_time, ws) queued event apply
+    pending_apply = []       # [(due_time, ws), ...] queued event re-applies
     fill_suppress_until = 0.0  # ignore our own fill-change events before this time
     off_state = (None, None)  # (off_seen frozenset, time first seen)
     current_map = {}         # address -> cell index of the layout we last applied
@@ -1130,6 +1132,7 @@ def run_daemon():
     last_sizes = {}          # address -> (w, h) we last applied
     resized_seen = set()     # addresses we already pinned+refit for one size change
     grids = set()            # workspace ids currently gridded/preserved
+    grid_members = {}        # workspace id -> set of addresses its grid covers
     pending_events = deque() # socket events awaiting processing (bounded per tick)
 
     def snap_sizes(mon, ws):
@@ -1140,11 +1143,12 @@ def run_daemon():
 
     def reapply(mon, ws, prio=None, force_first=None):
         """Apply the equal grid and refresh tracking. Returns the cell map."""
-        nonlocal last_sizes, resized_seen, current_rects, stretch_state
+        nonlocal last_sizes, resized_seen, current_rects, stretch_state, grid_members
         m, s, rects = apply_grid(mon, ws, prio, fill_dir, force_first)
         last_sizes = s
         current_rects = rects
         resized_seen = set()
+        grid_members[ws] = set(m)
         # The fresh grid already incorporates any stretch via extend_last_cell.
         target_cell = fill_target_cell(mon, ws, fill_dir)
         addr = next((a for a, c in m.items() if c == target_cell), None) if target_cell is not None else None
@@ -1194,7 +1198,7 @@ def run_daemon():
                         last_sizes = {a: (r[2], r[3]) for a, r in new_rects.items()}
                         last_apply = now
                         off_state = (None, None)
-                        pending_apply = None
+                        pending_apply = []
                         fill_suppress_until = now + GRACE
                     except Exception:
                         traceback.print_exc()
@@ -1207,6 +1211,7 @@ def run_daemon():
                     # re-tiles the workspace; consumes any captured snapshot.
                     restore_snapshot(wid)
                     grids.discard(wid)
+                    grid_members.pop(wid, None)
                     current_map = {}
                     current_rects = {}
                     stretch_state = (None, None)
@@ -1217,15 +1222,18 @@ def run_daemon():
                 # Grid the active workspace if it is currently marked equalized.
                 grid_if_needed(cur)
 
-            # 1) Process any event-triggered (debounced) re-grid for the managed ws.
-            if pending_apply is not None:
-                due, wid = pending_apply
+            # 1) Process any event-triggered (debounced) re-grids for the
+            #    affected workspace(s).
+            if pending_apply:
+                due = min(d for d, _w in pending_apply)
                 if now >= due:
                     mon, acur = monitor_and_ws()
-                    if mon is not None and wid in grids:
-                        current_map = reapply(mon, wid)
-                        last_apply = now
-                    pending_apply = None
+                    if mon is not None:
+                        for _due, wid in pending_apply:
+                            if _due <= now and wid in grids:
+                                current_map = reapply(mon, wid)
+                                last_apply = now
+                    pending_apply = []
 
             # 2) Drag-drop / resize detection on the active gridded workspace.
             if mon is not None and cur in grids and now - last_apply > GRACE:
@@ -1248,6 +1256,7 @@ def run_daemon():
                             current_rects = rects
                             resized_seen.add(foc)
                             current_map = {}
+                            grid_members[cur] = set(rects)
                             stretch_state = (None, None)
                             last_apply = now
                             off_state = (None, None)
@@ -1295,34 +1304,64 @@ def run_daemon():
                 # isn't gridded yet, grid it. Desktops already gridded stay
                 # preserved (we never released them on switch-away).
                 grid_if_needed(cur)
-                if cur in grids:
-                    # Ignore move/float events we just generated ourselves by
-                    # stretching a tile in place (see apply_fill_in_place).
-                    suppressed = time.monotonic() < fill_suppress_until
-                    # Ignore move/float events from the apply we just ran; the
-                    # debounced re-apply they would schedule is what makes the
-                    # toggle look like a double refresh.
-                    self_applied = now - last_apply < GRACE
-                    if line.startswith("movewindowv2>>") and not suppressed and not self_applied:
-                        raw = line[len("movewindowv2>>"):].split(",")
-                        addr = normalize_address(raw[0]) if raw else None
-                        try:
-                            target_ws = int(raw[1]) if len(raw) > 1 else None
-                        except (IndexError, ValueError):
-                            target_ws = None
-                        if addr and target_ws is not None and target_ws != cur:
-                            # Left the grid for another desktop: tile normally there.
-                            dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
-                        pending_apply = (now + EVENT_DEBOUNCE, cur)
-                    elif line.startswith("movewindow>>") and not suppressed and not self_applied:
+                # Ignore move/float events we just generated ourselves by
+                # stretching a tile in place (see apply_fill_in_place).
+                suppressed = time.monotonic() < fill_suppress_until
+                # Ignore move/float events from the apply we just ran; the
+                # debounced re-apply they would schedule is what makes the
+                # toggle look like a double refresh.
+                self_applied = now - last_apply < GRACE
+                if line.startswith("movewindowv2>>"):
+                    # SUPER+SHIFT+<num> shipped a window to another workspace.
+                    # The event only carries the target id, so the source grid
+                    # is located from per-workspace grid membership instead of
+                    # the currently active workspace. Handled outside the
+                    # `cur in grids` gate because the events can be drained
+                    # after the user has already switched desktops, and a
+                    # native (un-gridded) target still needs the source to
+                    # re-balance.
+                    raw = line[len("movewindowv2>>"):].split(",")
+                    moved = normalize_address(raw[0]) if raw else None
+                    try:
+                        target_ws = int(raw[1]) if len(raw) > 1 else None
+                    except (IndexError, ValueError):
+                        target_ws = None
+                    if moved and target_ws is not None:
+                        if target_ws not in wanted:
+                            # Native desktop (e.g. a brand-new empty one):
+                            # release the window so Hyprland re-tiles it to that
+                            # desktop's layout instead of it keeping the
+                            # equalized rect it had on the source desktop.
+                            dispatch(f'hl.dsp.window.float({{ window = "address:{moved}", action = "disable" }})')
+                        if target_ws in grids:
+                            # Fold the window into an already-gridded equalized
+                            # target desktop's layout.
+                            schedule = (now + EVENT_DEBOUNCE, target_ws)
+                            if schedule not in pending_apply:
+                                pending_apply.append(schedule)
+                        # Re-balance the source desktop now that the window left.
+                        source_ws = next(
+                            (
+                                wid
+                                for wid, members in grid_members.items()
+                                if wid != target_ws and moved in members
+                            ),
+                            None,
+                        )
+                        if source_ws is not None:
+                            schedule = (now + EVENT_DEBOUNCE, source_ws)
+                            if schedule not in pending_apply:
+                                pending_apply.append(schedule)
+                elif cur in grids:
+                    if line.startswith("movewindow>>") and not suppressed and not self_applied:
                         addr = normalize_address(line[len("movewindow>>"):].split(",")[0])
                         if addr:
                             dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
-                        pending_apply = (now + EVENT_DEBOUNCE, cur)
+                        pending_apply.append((now + EVENT_DEBOUNCE, cur))
                     elif line.startswith(("openwindow>>", "closewindow>>")) and not suppressed:
-                        pending_apply = (now + EVENT_DEBOUNCE, cur)
+                        pending_apply.append((now + EVENT_DEBOUNCE, cur))
                     elif line.startswith("changefloatingmode>>") and not suppressed and not self_applied:
-                        pending_apply = (now + EVENT_DEBOUNCE, cur)
+                        pending_apply.append((now + EVENT_DEBOUNCE, cur))
     finally:
         try:
             sock.close()
