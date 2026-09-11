@@ -128,6 +128,14 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 David Bigelow.
 
 ## Changelog
 
+### 1.2.1
+- Hardened the binding service against config-location attacks: the
+  `SUPER+E` binding is now written through a descriptor-relative, owner-checked
+  transaction. `~/.config/hypr` is walked component-by-component with
+  `O_NOFOLLOW`, each directory must be user-owned and not group/world-writable,
+  config files must be singly-linked user-owned regular files, and updates are
+  committed with an atomic `renameat2` compare-and-swap with rollback.
+
 ### 1.2.0
 - Marketplace-standard installation: the plugin is now added entirely with
   `omarchy plugin add <repo>.git --enable`. The installer script and the

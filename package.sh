@@ -33,13 +33,45 @@ FILES=(
 
 mkdir -p "$DIST"
 
+# Stage in a temp dir so the working tree is left untouched while the
+# distributed copy gets the version baked into EqualizeToggle.qml.
+STAGE="$DIST/.stage-$PKG"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+cp -r -t "$STAGE" "${FILES[@]}"
+
+python3 - "$STAGE/EqualizeToggle.qml" "$VERSION" <<'PY'
+import pathlib, sys
+qml = pathlib.Path(sys.argv[1])
+version = sys.argv[2]
+text = qml.read_text()
+replaced = False
+
+def bake(match):
+    global replaced
+    replaced = True
+    return match.group(1) + version + match.group(2)
+
+new = __import__("re").sub(
+    r'(property string pluginVersion: ")[^"]*(")',
+    bake,
+    text,
+)
+if not replaced:
+    raise SystemExit("package.sh: no pluginVersion property found in " + str(qml))
+if new != text:
+    qml.write_text(new)
+PY
+
 echo "Building $ARCHIVE"
 tar -czf "$ARCHIVE" \
   --exclude="__pycache__" \
   --exclude="*.pyc" \
   --transform "s|^|${PKG}/|" \
-  -C "$ROOT" \
+  -C "$STAGE" \
   "${FILES[@]}"
+
+rm -rf "$STAGE"
 
 echo "Created $(basename "$ARCHIVE")"
 echo "Contents:"

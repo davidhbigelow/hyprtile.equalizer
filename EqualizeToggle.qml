@@ -15,6 +15,7 @@ Panel {
   property bool refreshPending: false
   property string focusSection: "header"
   property bool cursorActive: false
+  readonly property string pluginVersion: "1.2.1"
 
   readonly property string scriptsDir: {
     var url = Qt.resolvedUrl("scripts")
@@ -238,6 +239,15 @@ Panel {
             font.family: root.panelFontFamily
             font.pixelSize: Style.font.title
             font.bold: true
+            horizontalAlignment: Text.AlignHCenter
+            width: parent.width
+          }
+
+          Text {
+            text: "v" + root.pluginVersion
+            color: Qt.darker(root.panelForeground, 1.6)
+            font.family: root.panelFontFamily
+            font.pixelSize: Style.font.caption
             horizontalAlignment: Text.AlignHCenter
             width: parent.width
           }

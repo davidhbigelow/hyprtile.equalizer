@@ -8,36 +8,77 @@ binding back when the plugin is disabled. It also removes any stale watcher
 autostart entries written by pre-1.2 installers; the watcher is launched by
 the Omarchy shell service instead of at Hyprland login, so an autostart entry
 is no longer created.
+
+All config reads and writes run inside a descriptor-relative, owner-checked
+transaction boundary against the user's real home directory (resolved from
+`pwd`, never from `$HOME`):
+
+* `~`, `~/.config` and `~/.config/hypr` are walked one component at a time
+  with O_NOFOLLOW and each must be a real directory owned by the invoking
+  user and not group/world-writable before the next component is trusted.
+  A symlinked or attacker-replaced ancestor causes a hard refusal.
+* `bindings.lua` / `autostart.lua` are opened through the hypr directory file
+  descriptor with O_NOFOLLOW and must be singly-linked regular files owned
+  by the user.
+* Updates are staged as an unpredictable O_EXCL temp file inside the same
+  verified directory, fsynced, then committed with `renameat2` -- an atomic
+  compare-and-swap that refuses to clobber a concurrent edit. If one half of
+  the two-file transaction commits and the other fails, the committed half is
+  rolled back.
+* The whole read-modify-write cycle is serialized with a user-owned lock file
+  kept in the verified hypr directory.
+
+For tests, `EQUALIZE_HOME` may point at a scratch home directory; every
+security check still applies to it.
 """
 
 import argparse
+import ctypes
+import errno
+import fcntl
 import os
-import stat as stat_module
+import pwd
+import secrets
+import stat
 import subprocess
 import sys
-import tempfile
+from dataclasses import dataclass
 
-HYPR_DIR = os.environ.get("EQUALIZE_HYPR_CONFIG_DIR") or os.path.join(
-    os.path.expanduser("~"), ".config", "hypr"
-)
-BINDINGS = os.path.join(HYPR_DIR, "bindings.lua")
-AUTOSTART = os.path.join(HYPR_DIR, "autostart.lua")
+PYTHON = "/usr/bin/python3"
+HYPRCTL = "/usr/bin/hyprctl"
+RELOAD_TIMEOUT = 8.0
+MAX_CONFIG_BYTES = 2 * 1024 * 1024
 
 BEGIN = "-- BEGIN hyprtile.equalize managed block"
 END = "-- END hyprtile.equalize managed block"
 BIND_TARGET = "SUPER + E"
 BIND_DESC = "Toggle live equalize mode"
 
+BINDINGS = "bindings.lua"
+AUTOSTART = "autostart.lua"
+LOCK_NAME = ".hyprtile.equalize.lock"
+
+RENAME_NOREPLACE = 1
+RENAME_EXCHANGE = 2
+LIBC = ctypes.CDLL(None, use_errno=True)
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 TOGGLE = os.path.realpath(os.path.join(SCRIPT_DIR, "equalize-toggle"))
 
-HYPRCTL = "/usr/bin/hyprctl"
-RELOAD_TIMEOUT = 8.0
-MAX_CONFIG_BYTES = 2 * 1024 * 1024
+
+class BindingError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Original:
+    exists: bool
+    data: bytes = b""
+    mode: int = 0o600
 
 
 def _block() -> str:
-    command = f"/usr/bin/python3 {TOGGLE}"
+    command = f"{PYTHON} {TOGGLE}"
     return (
         f"{BEGIN}\n"
         f"-- hyprtile.equalize: toggle live grid (SUPER + E)\n"
@@ -46,51 +87,271 @@ def _block() -> str:
     )
 
 
-def _open_read(path: str):
-    flags = os.O_RDONLY
+def _open_flags(directory: bool) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if directory:
+        flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    return os.open(path, flags)
+    return flags
 
 
-def _read_text(path: str) -> tuple:
-    """Return (content, mode) or (empty, mode) when the file is absent."""
+def _home_dir() -> str:
+    """Return the user's real home directory.
+
+    Resolved from the passwd database rather than `$HOME` so a poisoned HOME
+    environment variable can never steer the write elsewhere.
+    """
+    override = os.environ.get("EQUALIZE_HOME")
+    if override:
+        return override
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+def _open_owned_dir(path: str, uid: int) -> int:
     try:
-        fd = _open_read(path)
+        fd = os.open(path, _open_flags(directory=True))
+    except OSError as exc:
+        raise BindingError(f"refusing unsafe directory {path}: {exc}") from exc
+    info = os.fstat(fd)
+    if info.st_uid != uid or info.st_mode & 0o022:
+        os.close(fd)
+        raise BindingError(
+            f"directory must be owned by uid {uid} and not group/world-writable: {path}"
+        )
+    return fd
+
+
+def _open_or_create_owned_dir(parent_fd: int, name: str, uid: int, create: bool) -> int:
+    """Open `name` relative to `parent_fd`, refusing symlinks.
+
+    Returns -1 (without creating anything) only when the directory is
+    genuinely absent and `create` is False. A directory that exists but is a
+    symlink, foreign-owned, or group/world-writable is a hard refusal so a
+    read-only operation can never silently fall back onto a guarded path.
+    """
+    try:
+        fd = os.open(name, _open_flags(directory=True), dir_fd=parent_fd)
     except FileNotFoundError:
-        return "", 0o600
-    try:
-        st = os.fstat(fd)
-        mode = stat_module.S_IMODE(st.st_mode) or 0o600
-        with os.fdopen(fd, "rb") as handle:
-            raw = handle.read(MAX_CONFIG_BYTES + 1)
-    except OSError:
-        return "", 0o600
-    if len(raw) > MAX_CONFIG_BYTES:
-        return "", mode
-    return raw.decode("utf-8", "replace"), mode
+        if not create:
+            return -1
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        fd = os.open(name, _open_flags(directory=True), dir_fd=parent_fd)
+    except OSError as exc:
+        raise BindingError(f"refusing unsafe directory {name}: {exc}") from exc
+    info = os.fstat(fd)
+    if info.st_uid != uid or info.st_mode & 0o022:
+        os.close(fd)
+        raise BindingError(
+            f"directory must be owned by uid {uid} and not group/world-writable: {name}"
+        )
+    return fd
 
 
-def _write_text(path: str, text: str, mode: int) -> None:
-    directory = os.path.dirname(path)
+def _open_hypr_dir(create: bool) -> int:
+    """Open `~/.config/hypr` through verified, descriptor-relative ancestors."""
+    uid = os.getuid()
+    home_fd = _open_owned_dir(_home_dir(), uid)
     try:
-        os.makedirs(directory, mode=0o755, exist_ok=True)
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".equalize-bind-", text=True)
+        config_fd = _open_or_create_owned_dir(home_fd, ".config", uid, create)
+        if config_fd < 0:
+            return -1
         try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
-                handle.write(text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(tmp_path, mode)
-            os.replace(tmp_path, path)
-        except BaseException:
+            hypr_fd = _open_or_create_owned_dir(config_fd, "hypr", uid, create)
+            return hypr_fd
+        finally:
+            os.close(config_fd)
+    finally:
+        os.close(home_fd)
+
+
+def _read_original(dir_fd: int, name: str, uid: int) -> Original:
+    flags = _open_flags(directory=False)
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return Original(False)
+    except OSError as exc:
+        raise BindingError(f"refusing unsafe config file {name}: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1:
+            raise BindingError(
+                f"config must be a singly-linked regular file owned by uid {uid}: {name}"
+            )
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, MAX_CONFIG_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_CONFIG_BYTES:
+                raise BindingError(f"config exceeds {MAX_CONFIG_BYTES} bytes: {name}")
+        return Original(True, b"".join(chunks), stat.S_IMODE(info.st_mode))
+    finally:
+        os.close(fd)
+
+
+def _acquire_lock(hypr_fd: int, uid: int) -> int:
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    lock_fd = os.open(LOCK_NAME, flags, 0o600, dir_fd=hypr_fd)
+    try:
+        info = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != uid
+            or info.st_nlink != 1
+        ):
+            raise BindingError(
+                f"lock must be a singly-linked, user-owned regular file: {LOCK_NAME}"
+            )
+        os.fchmod(lock_fd, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(lock_fd)
+        raise
+    return lock_fd
+
+
+def _renameat2(dir_fd: int, old: str, new: str, flags: int) -> None:
+    rename = getattr(LIBC, "renameat2", None)
+    if rename is None:
+        raise BindingError("renameat2 is required for race-safe configuration updates")
+    result = rename(
+        ctypes.c_int(dir_fd),
+        ctypes.c_char_p(os.fsencode(old)),
+        ctypes.c_int(dir_fd),
+        ctypes.c_char_p(os.fsencode(new)),
+        ctypes.c_uint(flags),
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), new)
+
+
+def _restore_exchange(dir_fd: int, tmp_name: str, name: str, installed: Original, uid: int) -> None:
+    """Undo an exchange without discarding a later edit of the destination."""
+    _renameat2(dir_fd, tmp_name, name, RENAME_EXCHANGE)
+    try:
+        displaced = _read_original(dir_fd, tmp_name, uid)
+    except Exception as exc:
+        _renameat2(dir_fd, tmp_name, name, RENAME_EXCHANGE)
+        raise BindingError(f"could not safely restore {name}") from exc
+    if displaced == installed:
+        return
+    _renameat2(dir_fd, tmp_name, name, RENAME_EXCHANGE)
+    raise BindingError(f"configuration changed again while restoring {name}")
+
+
+def _atomic_write(dir_fd: int, name: str, expected: Original, new_data: bytes, uid: int) -> Original:
+    """Commit `new_data` as `name` with an atomic compare-and-swap.
+
+    The bytes are staged in the same verified directory, fsynced, then swapped
+    in with `renameat2`. If the file existed, the displaced version is
+    re-read and must equal `expected` or the swap is undone; if it did not
+    exist, RENAME_NOREPLACE refuses to clobber anything that appeared
+    concurrently. Returns the installed state.
+    """
+    if len(new_data) > MAX_CONFIG_BYTES:
+        raise BindingError(f"refusing oversized config write: {name}")
+    mode = expected.mode if expected.exists else 0o600
+    tmp_name = f".hyprtile.equalize.{secrets.token_hex(16)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(tmp_name, flags, mode & 0o777, dir_fd=dir_fd)
+    try:
+        os.fchmod(fd, mode & 0o777)
+        view = memoryview(new_data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        installed = Original(True, new_data, mode & 0o777)
+        if expected.exists:
             try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
-            raise
-    except OSError:
-        pass
+                _renameat2(dir_fd, tmp_name, name, RENAME_EXCHANGE)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    raise BindingError(
+                        f"configuration disappeared concurrently; refusing to replace {name}"
+                    ) from exc
+                raise
+            try:
+                displaced = _read_original(dir_fd, tmp_name, uid)
+                matches = displaced == expected
+            except Exception as exc:
+                _restore_exchange(dir_fd, tmp_name, name, installed, uid)
+                raise BindingError(
+                    f"configuration changed concurrently; refusing to replace {name}"
+                ) from exc
+            if not matches:
+                _restore_exchange(dir_fd, tmp_name, name, installed, uid)
+                raise BindingError(
+                    f"configuration changed concurrently; refusing to replace {name}"
+                )
+        else:
+            try:
+                _renameat2(dir_fd, tmp_name, name, RENAME_NOREPLACE)
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    raise BindingError(
+                        f"configuration appeared concurrently; refusing to replace {name}"
+                    ) from exc
+                raise
+        os.fsync(dir_fd)
+        return installed
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_remove(dir_fd: int, name: str, expected: Original, uid: int) -> None:
+    """Remove `name` only if its contents still equal `expected`."""
+    tmp_name = f".hyprtile.equalize.{secrets.token_hex(16)}.removed"
+    try:
+        _renameat2(dir_fd, name, tmp_name, RENAME_NOREPLACE)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            raise BindingError(
+                f"configuration disappeared concurrently; refusing to remove {name}"
+            ) from exc
+        raise
+    try:
+        displaced = _read_original(dir_fd, tmp_name, uid)
+        if displaced != expected:
+            try:
+                _renameat2(dir_fd, tmp_name, name, RENAME_NOREPLACE)
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    raise BindingError(
+                        f"configuration changed again while restoring {name}"
+                    ) from exc
+                raise
+            raise BindingError(
+                f"configuration changed concurrently; refusing to remove {name}"
+            )
+        os.unlink(tmp_name, dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    except BindingError:
+        raise
+    except Exception as exc:
+        raise BindingError(f"could not verify removed configuration: {name}") from exc
+    finally:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
 
 
 def _settle(text: str, filekind: str, ensure_block: bool) -> str:
@@ -131,8 +392,18 @@ def _settle(text: str, filekind: str, ensure_block: bool) -> str:
     return "".join(out)
 
 
-def _changed(new_text: str, old_text: str) -> bool:
-    return new_text != old_text
+def _decode(original: Original) -> str:
+    if not original.exists:
+        return ""
+    return original.data.decode("utf-8", "replace")
+
+
+def _plan(original: Original, filekind: str, ensure_block: bool):
+    text = _decode(original)
+    new_text = _settle(text, filekind, ensure_block)
+    if new_text == text:
+        return None
+    return new_text.encode("utf-8")
 
 
 def _reload() -> None:
@@ -148,44 +419,101 @@ def _reload() -> None:
         pass
 
 
-def _apply(path: str, filekind: str, ensure_block: bool) -> bool:
-    text, mode = _read_text(path)
-    if path == BINDINGS:
-        new_text = _settle(text, filekind, ensure_block)
+def _restore(dir_fd: int, name: str, original: Original, installed: Original, uid: int) -> None:
+    current = _read_original(dir_fd, name, uid)
+    if current == original:
+        return
+    if current != installed:
+        raise BindingError(f"configuration changed concurrently; refusing to roll back {name}")
+    if original.exists:
+        _atomic_write(dir_fd, name, installed, original.data, uid)
     else:
-        new_text = _settle(text, filekind, False)
-    if new_text == text:
-        return False
-    _write_text(path, new_text, mode)
-    return True
+        _atomic_remove(dir_fd, name, installed, uid)
 
 
 def ensure() -> int:
-    bindings_changed = _apply(BINDINGS, "bindings", True)
-    autostart_changed = _apply(AUTOSTART, "autostart", False)
-    if bindings_changed or autostart_changed:
-        _reload()
-        print("updated")
-    else:
-        print("ok")
-    return 0
+    uid = os.getuid()
+    hypr_fd = _open_hypr_dir(create=True)
+    lock_fd = _acquire_lock(hypr_fd, uid)
+    try:
+        planned = {}
+        for name, kind, ensure_block in (
+            (BINDINGS, "bindings", True),
+            (AUTOSTART, "autostart", False),
+        ):
+            original = _read_original(hypr_fd, name, uid)
+            new_data = _plan(original, kind, ensure_block)
+            if new_data is not None:
+                planned[name] = (original, new_data)
+        committed = []
+        try:
+            for name, (original, new_data) in planned.items():
+                installed = _atomic_write(hypr_fd, name, original, new_data, uid)
+                committed.append((name, original, installed))
+        except Exception as exc:
+            errors = []
+            for name, original, installed in reversed(committed):
+                try:
+                    _restore(hypr_fd, name, original, installed, uid)
+                except Exception as restore_exc:
+                    errors.append(f"restore {name}: {restore_exc}")
+            if errors:
+                raise BindingError(
+                    f"binding update failed ({exc}); rollback failed ({'; '.join(errors)})"
+                ) from exc
+            raise
+        if committed:
+            _reload()
+            print("updated")
+        else:
+            print("ok")
+        return 0
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        os.close(hypr_fd)
 
 
 def remove() -> int:
-    bindings_changed = _apply(BINDINGS, "bindings", False)
-    autostart_changed = _apply(AUTOSTART, "autostart", False)
-    if bindings_changed or autostart_changed:
-        _reload()
-        print("removed")
-    else:
+    uid = os.getuid()
+    hypr_fd = _open_hypr_dir(create=False)
+    if hypr_fd < 0:
         print("clean")
-    return 0
+        return 0
+    lock_fd = _acquire_lock(hypr_fd, uid)
+    try:
+        changed = False
+        for name, kind in ((BINDINGS, "bindings"), (AUTOSTART, "autostart")):
+            original = _read_original(hypr_fd, name, uid)
+            new_data = _plan(original, kind, False)
+            if new_data is not None:
+                _atomic_write(hypr_fd, name, original, new_data, uid)
+                changed = True
+        if changed:
+            _reload()
+            print("removed")
+        else:
+            print("clean")
+        return 0
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        os.close(hypr_fd)
 
 
 def status() -> int:
-    text, _mode = _read_text(BINDINGS)
-    print("managed" if _block() in text else "absent")
-    return 0
+    uid = os.getuid()
+    hypr_fd = _open_hypr_dir(create=False)
+    if hypr_fd < 0:
+        print("absent")
+        return 0
+    try:
+        original = _read_original(hypr_fd, BINDINGS, uid)
+        text = _decode(original)
+        print("managed" if _block() in text else "absent")
+        return 0
+    finally:
+        os.close(hypr_fd)
 
 
 def main() -> int:
@@ -195,12 +523,16 @@ def main() -> int:
     sub.add_parser("remove", help="remove the managed binding block and watcher autostart entries")
     sub.add_parser("status", help="report whether the managed binding block is present")
     args = parser.parse_args()
-    if args.action == "ensure":
-        return ensure()
-    if args.action == "remove":
-        return remove()
-    if args.action == "status":
-        return status()
+    try:
+        if args.action == "ensure":
+            return ensure()
+        if args.action == "remove":
+            return remove()
+        if args.action == "status":
+            return status()
+    except (BindingError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     return 1
 
 
