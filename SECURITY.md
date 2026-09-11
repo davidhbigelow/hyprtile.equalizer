@@ -49,8 +49,19 @@ explicit argument list (`shell=False`), fixed absolute tool paths, a locked
   through a temp file plus atomic rename, and a lock guards concurrent access.
 - The `SUPER+E` binding is the plugin's only edit to the user's Hyprland
   config. It lives inside `~/.config/hypr/bindings.lua` delimited by explicit
-  begin/end markers, is applied atomically with a temp-file rename, and is
-  removed when the plugin is disabled or removed.
+  begin/end markers, is applied atomically, and is removed when the plugin is
+  disabled or removed.
+- The binding service resolves the config location from the passwd database
+  (never `$HOME`) and walks `~`, `~/.config`, and `~/.config/hypr` one
+  component at a time. Every component must be a real directory owned by the
+  invoking user and not group/world-writable; a symlinked or swapped ancestor
+  aborts the operation.
+- `bindings.lua` / `autostart.lua` are read through the verified directory's
+  file descriptor with `O_NOFOLLOW` and must be singly-linked regular files
+  owned by the user. Updates are staged and fsynced inside the same directory,
+  then committed with `renameat2` as a compare-and-swap that refuses to
+  clobber concurrent edits; a failing half of the two-file update is rolled
+  back. A user-owned lock file serializes the read-modify-write cycle.
 
 ## Reporting
 
