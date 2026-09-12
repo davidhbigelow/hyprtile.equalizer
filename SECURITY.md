@@ -18,8 +18,8 @@ file documents the trust boundary and the hardening measures the plugin applies.
 ### No shell execution
 
 The plugin never shells out. All process spawning uses `subprocess` with an
-explicit argument list (`shell=False`), fixed absolute tool paths, a locked
-`PATH=/usr/bin` environment, output caps, and timeouts. There is no
+explicit argument list (`shell=False`), fixed absolute tool paths, output
+caps where output is consumed, and timeouts. There is no
 `os.system`, `os.popen`, `eval`, or dynamic module loading.
 
 ### Socket trust checks
@@ -31,12 +31,17 @@ explicit argument list (`shell=False`), fixed absolute tool paths, a locked
   expected path under the user's `XDG_RUNTIME_DIR`, are real `S_ISSOCK`
   sockets, and are owned by the invoking uid. Symlink redirects or planted
   sockets cause the watcher to refuse to connect (falling back to `hyprctl`).
+- Equalize-aware directional movement uses a private `0600` datagram socket
+  under the verified user runtime directory. Its name includes the validated
+  Hyprland instance signature; requests carry a bounded direction, workspace
+  id, and hexadecimal window address and are rejected unless they still match
+  the active focused window.
 
 ### Strict input validation
 
 - Every dispatch command passes a single validated chokepoint that coerces
   window addresses to a strict `0x` hexadecimal form and window geometry to
-  bounded integers; anything else is dropped.
+  integer literals; anything else is dropped.
 - Event lines are parsed against a fixed grammar and only recognized window
   events are acted on; unrecognized or malformed lines are ignored.
 - The event loop drains at most `MAX_EVENT_LINES_PER_TICK` lines per tick, so
@@ -45,12 +50,15 @@ explicit argument list (`shell=False`), fixed absolute tool paths, a locked
 ### Local-file safety
 
 - State persists under `~/.local/state/hyprtile.equalizer/` in a private
-  `0700` directory; reads and writes are opened with `O_NOFOLLOW`, writes go
-  through a temp file plus atomic rename, and a lock guards concurrent access.
-- The `SUPER+E` binding is the plugin's only edit to the user's Hyprland
-  config. It lives inside `~/.config/hypr/bindings.lua` delimited by explicit
-  begin/end markers, is applied atomically, and is removed when the plugin is
-  disabled or removed.
+  `0700` directory. Every path component is opened through owner-checked
+  `O_NOFOLLOW` descriptors; data and lock files must be singly-linked,
+  user-owned regular files. Writes are staged under unpredictable exclusive
+  names, fsynced, and atomically published with descriptor-relative rename;
+  reads, cleanup, and snapshot removal are descriptor-relative as well.
+- The plugin's only Hyprland config edit is one managed block containing the
+  `SUPER+E` toggle and four `SUPER+SHIFT+Arrow` overrides. Outside equalize
+  mode those overrides dispatch Hyprland's native directional swaps. The block
+  is applied atomically and removed when the plugin is disabled or removed.
 - The binding service resolves the config location from the passwd database
   (never `$HOME`) and walks `~`, `~/.config`, and `~/.config/hypr` one
   component at a time. Every component must be a real directory owned by the

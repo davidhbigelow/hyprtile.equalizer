@@ -27,8 +27,9 @@ omarchy plugin add https://github.com/davidhbigelow/hyprtile.equalizer.git --ena
 
 That clones the plugin, places its toolbar widget in the bar, and enables it.
 No installer script and no extra steps: enabling the plugin registers the
-`SUPER+E` binding, starts the layout watcher, and rolls both back when the
-plugin is disabled.
+`SUPER+E` toggle and equalize-aware `SUPER+SHIFT+Arrow` movement bindings,
+starts the layout watcher, and rolls everything back when the plugin is
+disabled.
 
 You can place the widget in a specific section:
 
@@ -38,7 +39,8 @@ omarchy plugin enable hyprtile.equalize --section right --index end
 
 ### How it manages itself
 
-- The `SUPER+E` binding lives in `~/.config/hypr/bindings.lua` inside a
+- The toggle and four directional movement bindings live in
+  `~/.config/hypr/bindings.lua` inside a
   `-- BEGIN/END hyprtile.equalize managed block`. The plugin writes or updates
   that block when enabled and removes it when disabled, so the binding always
   matches the running plugin location and never leaves a dead shortcut behind.
@@ -73,8 +75,12 @@ omarchy plugin enable hyprtile.equalize --section right --index end
   others remain stock Hyprland.
 - **Drop-aware layout** -- dragging a window to a new slot re-balances the
   grid around the drop target after a short debounce.
-- **Resize pinning** -- resizing a tile with `SUPER +/-` keeps that tile's
-  new size while the rest of the grid re-equalizes around it.
+- **Localized resizing** -- `SUPER +/-` adjusts width within the active row;
+  `SUPER+SHIFT +/-` adjusts shared row heights. Neighboring tiles absorb the
+  change without rebuilding unrelated rows.
+- **Geometry-aware movement** -- `SUPER+SHIFT+Arrow` swaps logical slots,
+  including incomplete stretched rows. Windows inherit destination geometry,
+  and app minimum sizes are measured before the move is displayed.
 - **Clean toggle-off** -- turning equalize off de-floats every window and
   Hyprland re-tiles from scratch; nothing is left stranded.
 - **Toolbar widget** -- mirrors the keyboard shortcut and shows current state
@@ -120,13 +126,33 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 David Bigelow.
   stderr.
 - `scripts/equalize-binding` manages the binding lifecycle; inspect its state
   with `scripts/equalize-binding status`.
-- Run the test suite with `python3 tests/test_equalize_binding.py`.
+- Run the test suite with `python3 -m unittest discover -s tests -v`.
 - The shell plugin auto-reloads on save; if Quickshell caches old code, run
   `omarchy restart shell`.
 
 ---
 
 ## Changelog
+
+### 1.3.0
+- Replaced column-wide resize pinning with persistent slot geometry: width
+  changes stay within one row, while height changes rebalance complete row
+  bands without overlap.
+- Added equalize-aware `SUPER+SHIFT+Arrow` movement. Keyboard swaps target the
+  next occupied logical slot, preserve stretched remainder behavior, and fall
+  back to Hyprland's native swap outside equalize mode.
+- Windows now inherit destination-slot geometry during keyboard and pointer
+  moves. A fast preflight measures application minimum sizes and adjusts
+  neighboring slots before displaying the move.
+- Preserved custom layout state independently per equalized workspace and
+  repaired marked grids if an external event unexpectedly de-floats a tile.
+- Added a private, per-Hyprland-instance Unix socket for validated local
+  movement requests bound to the initiating workspace and focused window.
+- Added geometry, movement, minimum-size, socket-trust, and binding regression
+  coverage.
+- Reworked automatic state storage to walk owner-checked, no-follow directory
+  descriptors and publish every state file atomically relative to the verified
+  state directory, closing ancestor and destination-swap races.
 
 ### 1.2.2
 - Moving a window from an equalized workspace now re-balances the source

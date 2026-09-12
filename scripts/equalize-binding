@@ -1,7 +1,7 @@
 #!/usr/bin/python3
-"""Manage the plugin's SUPER+E binding and legacy watch autostart entries.
+"""Manage the plugin's equalize bindings and legacy watch autostart entries.
 
-The plugin keeps its keybinding in `~/.config/hypr/bindings.lua` inside an
+The plugin keeps its keybindings in `~/.config/hypr/bindings.lua` inside an
 explicit begin/end marker block. This module makes that block match the
 currently running plugin location, keeps Hyprland loadable, and rolls the
 binding back when the plugin is disabled. It also removes any stale watcher
@@ -64,6 +64,7 @@ LIBC = ctypes.CDLL(None, use_errno=True)
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 TOGGLE = os.path.realpath(os.path.join(SCRIPT_DIR, "equalize-toggle"))
+MOVE = os.path.realpath(os.path.join(SCRIPT_DIR, "equalize-move"))
 
 
 class BindingError(RuntimeError):
@@ -79,10 +80,20 @@ class Original:
 
 def _block() -> str:
     command = f"{PYTHON} {TOGGLE}"
+    move_command = f"{PYTHON} {MOVE}"
     return (
         f"{BEGIN}\n"
         f"-- hyprtile.equalize: toggle live grid (SUPER + E)\n"
         f'o.bind("{BIND_TARGET}", "{BIND_DESC}", "{command}")\n'
+        f"-- Preserve logical slot movement while equalize mode is active.\n"
+        f'hl.unbind("SUPER + SHIFT + LEFT")\n'
+        f'hl.unbind("SUPER + SHIFT + RIGHT")\n'
+        f'hl.unbind("SUPER + SHIFT + UP")\n'
+        f'hl.unbind("SUPER + SHIFT + DOWN")\n'
+        f'o.bind("SUPER + SHIFT + LEFT", "Swap window to the left", "{move_command} left")\n'
+        f'o.bind("SUPER + SHIFT + RIGHT", "Swap window to the right", "{move_command} right")\n'
+        f'o.bind("SUPER + SHIFT + UP", "Swap window up", "{move_command} up")\n'
+        f'o.bind("SUPER + SHIFT + DOWN", "Swap window down", "{move_command} down")\n'
         f"{END}\n"
     )
 

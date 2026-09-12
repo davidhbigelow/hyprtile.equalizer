@@ -98,6 +98,11 @@ class EqualizeBindingTests(unittest.TestCase):
         self.assertEqual(first, pathlib.Path(os.path.join(self.hypr, b.BINDINGS)).read_text())
         self.assertEqual(first.count(b.BEGIN), 1)
 
+    def test_managed_block_overrides_directional_swaps(self):
+        block = b._block()
+        self.assertIn('hl.unbind("SUPER + SHIFT + RIGHT")', block)
+        self.assertIn("equalize-move right", block)
+
     def test_remove_cleans_binding_but_keeps_other_content(self):
         self._default_seed()
         b.ensure()

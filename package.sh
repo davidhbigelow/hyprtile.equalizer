@@ -24,6 +24,7 @@ fi
 ARCHIVE="$DIST/${PKG}-${VERSION}.tar.gz"
 FILES=(
   README.md
+  SECURITY.md
   LICENSE
   manifest.json
   EqualizeToggle.qml
