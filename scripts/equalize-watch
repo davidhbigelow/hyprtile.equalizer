@@ -40,6 +40,12 @@ IPC_SOCKET = os.path.join(
     os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""),
     ".socket.sock",
 )
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+MOVE_SOCKET = os.path.join(
+    RUNTIME_DIR,
+    "hyprtile-equalize-move-%s.sock"
+    % os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""),
+)
 SCRIPT_PATH = os.path.realpath(__file__)
 HYPRCTL = "/usr/bin/hyprctl"
 
@@ -154,6 +160,8 @@ GRACE = 1.0          # suppress detection immediately after we apply
 MOVE_THRESHOLD = 40  # logical px a float must deviate from its cell to matter
 EVENT_DEBOUNCE = 0.3  # settle delay after an event-triggered layout change
 MAX_EVENT_LINES_PER_TICK = 128  # bound on socket events handled per loop tick
+GRID_GAP = 18
+MIN_TILE_SIZE = 80
 
 
 def read_layout_opts():
@@ -282,6 +290,35 @@ def monitor_and_ws():
     ws_payload = hyprctl_json(["activeworkspace", "-j"])
     ws = ws_payload.get("id") if isinstance(ws_payload, dict) else None
     return mon, ws
+
+
+def monitor_for_workspace(ws):
+    monitors = hyprctl_json(["monitors", "-j"])
+    if not isinstance(monitors, list):
+        return None
+    for mon in monitors:
+        if isinstance(mon, dict) and (mon.get("activeWorkspace") or {}).get("id") == ws:
+            return mon
+    clients = hyprctl_json(["clients", "-j"])
+    if isinstance(clients, list):
+        monitor_id = next(
+            (
+                client.get("monitor")
+                for client in clients
+                if isinstance(client, dict)
+                and (client.get("workspace") or {}).get("id") == ws
+            ),
+            None,
+        )
+        return next(
+            (
+                mon
+                for mon in monitors
+                if isinstance(mon, dict) and mon.get("id") == monitor_id
+            ),
+            None,
+        )
+    return None
 
 
 def current_rows(mon, ws):
@@ -567,7 +604,7 @@ def extend_last_cell(mon, targets, applied, fill_dir):
 def apply_fill_in_place(mon, ws, fill_dir, current_rects, cell_map, stretch_state):
     """Adjust only the stretched tile(s) when the fill direction changes.
 
-    `stretch_state` is the previous (addr, dir) we stretched, or (None, None).
+    `stretch_state` retains (address, direction, pre-stretch rectangle).
     Returns (updated_rects, new_stretch_state).
     """
     cells = cell_list(mon, ws)
@@ -578,7 +615,8 @@ def apply_fill_in_place(mon, ws, fill_dir, current_rects, cell_map, stretch_stat
     bottom = g["t"] + pad + (g["h"] - 2 * pad)
 
     updated = dict(current_rects)
-    prev_addr, prev_dir = stretch_state
+    prev_addr = stretch_state[0] if stretch_state else None
+    prev_base = stretch_state[2] if len(stretch_state) > 2 else None
 
     def natural_cell_for(addr):
         idx = cell_map.get(addr)
@@ -588,7 +626,7 @@ def apply_fill_in_place(mon, ws, fill_dir, current_rects, cell_map, stretch_stat
         return (nx, ny, nw, nh)
 
     def restore_tile(addr):
-        nat = natural_cell_for(addr)
+        nat = prev_base if addr == prev_addr and prev_base else natural_cell_for(addr)
         if nat is None:
             return
         nx, ny, nw, nh = nat
@@ -606,11 +644,12 @@ def apply_fill_in_place(mon, ws, fill_dir, current_rects, cell_map, stretch_stat
         restore_tile(prev_addr)
 
     if fill_dir == "off" or new_target_addr is None or new_target_cell is None:
-        return updated, (None, None)
+        return updated, (None, None, None)
 
     # Stretch the new target tile in place.
     _, _, tx, ty, tw, th = cells[new_target_cell]
     ax, ay, aw, ah = updated.get(new_target_addr, (tx, ty, tw, th))
+    stretch_base = (ax, ay, aw, ah)
     if fill_dir == "horizontal":
         new_w = int(round(row_end - ax))
         new_rect = (ax, ay, new_w, ah) if new_w > aw else (ax, ay, aw, ah)
@@ -624,11 +663,34 @@ def apply_fill_in_place(mon, ws, fill_dir, current_rects, cell_map, stretch_stat
         dispatch(f'hl.dsp.window.move({{ window = "address:{new_target_addr}", x = {nx}, y = {ny}, relative = false }})')
         updated[new_target_addr] = new_rect
 
-    return updated, (new_target_addr, fill_dir)
+    return updated, (new_target_addr, fill_dir, stretch_base)
+
+
+def remove_stretch(rects, stretch_state):
+    base = dict(rects)
+    if stretch_state and len(stretch_state) > 2:
+        addr, _direction, original = stretch_state
+        if addr in base and original is not None:
+            base[addr] = original
+    return base
+
+
+def fill_layout(mon, ws, rects, cell_map, fill_dir):
+    target_cell = fill_target_cell(mon, ws, fill_dir)
+    target_addr = next(
+        (addr for addr, cell in cell_map.items() if cell == target_cell), None
+    )
+    stretch_base = rects.get(target_addr) if target_addr else None
+    targets = [(addr, *rect) for addr, rect in rects.items()]
+    filled = extend_last_cell(mon, targets, cell_map, fill_dir)
+    return (
+        {addr: (x, y, width, height) for addr, x, y, width, height in filled},
+        (target_addr, fill_dir, stretch_base),
+    )
 
 
 def apply_grid(mon, ws, prio_order=None, fill_dir="off", force_first_addr=None):
-    """Float + equalize all managed windows. Returns (applied_map, sizes, rects)."""
+    """Float + equalize all managed windows, retaining pre-fill geometry."""
     targets, applied = nearest_layout(mon, ws, prio_order, force_first_addr)
     sizes = {}
     rects = {}
@@ -654,6 +716,11 @@ def apply_grid(mon, ws, prio_order=None, fill_dir="off", force_first_addr=None):
     applied, sizes, rects = _fit_min_sizes(mon, ws, targets, applied, sizes, rects)
     # Phase 4: fill-stretch the last cell, then dispatch only what changed.
     fitted = [(a, *(rects.get(a, (x, y, w, h)))) for a, x, y, w, h in targets]
+    target_cell = fill_target_cell(mon, ws, fill_dir)
+    target_addr = next(
+        (addr for addr, cell in applied.items() if cell == target_cell), None
+    )
+    stretch_base = rects.get(target_addr) if target_addr else None
     stretched = extend_last_cell(mon, fitted, applied, fill_dir)
     for addr, x, y, w, h in stretched:
         px, py, pw, ph = rects.get(addr, (x, y, w, h))
@@ -662,7 +729,7 @@ def apply_grid(mon, ws, prio_order=None, fill_dir="off", force_first_addr=None):
             dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {x}, y = {y}, relative = false }})')
             rects[addr] = (x, y, w, h)
             sizes[addr] = (w, h)
-    return applied, sizes, rects
+    return applied, sizes, rects, (target_addr, fill_dir, stretch_base)
 
 
 def _fit_min_sizes(mon, ws, targets, applied, fallback_sizes, fallback_rects):
@@ -785,220 +852,250 @@ def _fit_min_sizes(mon, ws, targets, applied, fallback_sizes, fallback_rects):
     return applied, sizes, rects
 
 
-def resize_fit_layout(mon, ws, pinned_addr):
-    """Re-fit a grid after one window was resized (via SUPER +/-).
+def _split_delta(amount, before_capacity, after_capacity):
+    """Split growth around a tile, spilling to whichever side has room."""
+    before = min(amount // 2, before_capacity)
+    after = min(amount - before, after_capacity)
+    before += min(amount - before - after, before_capacity - before)
+    return before, after
 
-    The resized ("pinned") window keeps its current size and position. Every
-    other window is re-equalized to share the leftover space: the pinned
-    window's column is its new width and its row its new height, and the
-    remaining columns/rows split the rest equally with exact gaps.
 
-    Returns (targets, applied) where targets lists (address, x, y, w, h).
-    The pinned window is NOT moved/resized (targets excludes it).
-    """
-    g = geometry(mon)
-    rows = current_rows(mon, ws)
-    n = len(rows)
-    pin = None
-    for w in rows:
-        if w["address"] == pinned_addr:
-            pin = w
+def _take_nearest(values, indexes, amount, minimums):
+    """Remove pixels from nearest neighbors first and return the amount taken."""
+    taken = 0
+    for index in indexes:
+        available = max(0, values[index] - minimums[index])
+        change = min(amount - taken, available)
+        values[index] -= change
+        taken += change
+        if taken == amount:
             break
-    if pin is None or n <= 1:
-        return [], {}
-
-    cols = max(1, math.ceil(math.sqrt(n)))
-    rows_n = math.ceil(n / cols)
-    pad = GAPS_OUT + BORDER
-    rx = g["l"] + pad
-    ry = g["t"] + pad
-    rw = g["w"] - 2 * pad
-    rh = g["h"] - 2 * pad
-    G = 18
-
-    px, py = pin["at"]
-    pw, ph = pin["size"]
-    # Keep the pin inside the region no matter how it was resized.
-    pw = max(1, min(pw, rw))
-    ph = max(1, min(ph, rh))
-    # A resize is center-anchored: the window's center stays put while it
-    # grows/shrinks, but its top-left can drift (even off-screen). Anchor the
-    # pin by its stable center and recompute its top-left from that, then clamp
-    # the whole box inside the region so the rest of the grid tiles around the
-    # pin on-screen rather than spilling off the left/top.
-    px = (px + pw / 2.0) - pw / 2.0
-    py = (py + ph / 2.0) - ph / 2.0
-    px = max(rx, min(px, rx + rw - pw))
-    py = max(ry, min(py, ry + rh - ph))
-
-    # Enclosure index for the pin (row-major), matched by address.
-    pin_idx = next(i for i, w in enumerate(rows) if w["address"] == pinned_addr)
-    # The pin's effective row/col comes from its CLAMPED position (it may have
-    # been pushed to a different cell than it began in), not its original index.
-    def edges(origin, span, count, gap):
-        tw = (span - gap * (count - 1)) / count
-        return [origin + c * (tw + gap) + tw / 2.0 for c in range(count)]
-    pcx = px + pw / 2.0
-    pcy = py + ph / 2.0
-    ccx = edges(rx, rw, cols, G)
-    ccy = edges(ry, rh, rows_n, G)
-    pc = min(range(cols), key=lambda c: abs(ccx[c] - pcx))
-    pr = min(range(rows_n), key=lambda r: abs(ccy[r] - pcy))
-    # Each window's own current center, for nearest-free-slot matching.
-    centers = [(w["at"][0] + w["size"][0] / 2.0, w["at"][1] + w["size"][1] / 2.0) for w in rows]
-
-    def distribute(sizes, gap, first, span):
-        # sizes = list of per-slot sizes (pin slot already sized). Returns
-        # (positions, sizes). Slots at `pinned_slot` keep their size and edge;
-        # free slots split the remaining span equally.
-        pass
-
-    # Build column geometry: column `pc` has width pw with left edge px; other
-    # columns share the leftover, equal across the spans left/right of pc.
-    def col_geom():
-        left_span = px - rx
-        right_span = (rx + rw) - (px + pw)
-        xs = [0.0] * cols
-        ws_ = [0.0] * cols
-        ws_[pc] = pw
-        xs[pc] = px
-        if pc > 0:
-            # pc gaps: (pc-1) internal + 1 between leftmost group and the pin.
-            wl = (left_span - G * pc) / pc
-            if wl < 0:
-                wl = 0
-            for i in range(pc - 1, -1, -1):
-                xs[i] = px - G * (pc - i) - wl * (pc - i)
-                ws_[i] = wl
-        if pc < cols - 1:
-            m = cols - 1 - pc
-            wl = (right_span - G * m) / m
-            if wl < 0:
-                wl = 0
-            for i in range(pc + 1, cols):
-                xs[i] = px + pw + G * (i - pc) + wl * (i - pc - 1)
-                ws_[i] = wl
-        return xs, ws_
-
-    def row_geom():
-        top_span = py - ry
-        bottom_span = (ry + rh) - (py + ph)
-        ys = [0.0] * rows_n
-        hs_ = [0.0] * rows_n
-        hs_[pr] = ph
-        ys[pr] = py
-        if pr > 0:
-            # pr gaps: (pr-1) internal + 1 between top group and the pin.
-            hl_ = (top_span - G * pr) / pr
-            if hl_ < 0:
-                hl_ = 0
-            for i in range(pr - 1, -1, -1):
-                ys[i] = py - G * (pr - i) - hl_ * (pr - i)
-                hs_[i] = hl_
-        if pr < rows_n - 1:
-            m = rows_n - 1 - pr
-            hl_ = (bottom_span - G * m) / m
-            if hl_ < 0:
-                hl_ = 0
-            for i in range(pr + 1, rows_n):
-                ys[i] = py + ph + G * (i - pr) + hl_ * (i - pr - 1)
-                hs_[i] = hl_
-        return ys, hs_
-
-    xs, ws_ = col_geom()
-    ys, hs_ = row_geom()
-
-    # Recompute integer left edges and derive widths from them to prevent
-    # ±1px overlap that independent rounding of position and size can cause.
-    xs_int = [int(round(x)) for x in xs]
-    ys_int = [int(round(y)) for y in ys]
-    ws_int = []
-    for c in range(cols):
-        if c + 1 < cols:
-            ws_int.append(xs_int[c + 1] - xs_int[c] - G)
-        else:
-            ws_int.append(int(round(rx + rw)) - xs_int[c])
-    hs_int = []
-    for r in range(rows_n):
-        if r + 1 < rows_n:
-            hs_int.append(ys_int[r + 1] - ys_int[r] - G)
-        else:
-            hs_int.append(int(round(ry + rh)) - ys_int[r])
-
-    # Assign each (non-pin) window to the free slot nearest its center.
-    cells = []
-    for r in range(rows_n):
-        for c in range(cols):
-            cells.append((r, c))
-    pin_cell = (pr, pc)
-    free = [cell for cell in cells if cell != pin_cell]
-
-    assigned = {}
-    remaining = [i for i in range(n) if i != pin_idx]
-    while remaining:
-        best = None
-        bd = float("inf")
-        for i in remaining:
-            wx, wy = centers[i]
-            for (r, c) in free:
-                x = xs[c] + ws_[c] / 2.0
-                y = ys[r] + hs_[r] / 2.0
-                d = (wx - x) ** 2 + (wy - y) ** 2
-                if d < bd:
-                    bd = d
-                    best = (i, r, c)
-        i, r, c = best
-        assigned[i] = (r, c)
-        remaining.remove(i)
-        free.remove((r, c))
-
-    targets = []
-    applied = {}
-    for i, (r, c) in assigned.items():
-        x = xs_int[c]
-        y = ys_int[r]
-        w = ws_int[c]
-        h = hs_int[r]
-        targets.append((rows[i]["address"], x, y, w, h))
-        applied[rows[i]["address"]] = (r, c)
-    applied[pin["address"]] = (pr, pc)
-    return targets, applied, (int(round(px)), int(round(py)), int(round(pw)), int(round(ph)))
+    return taken
 
 
-def apply_resize_fit(mon, ws, pinned_addr, fill_dir="off"):
-    targets, applied, pin_box = resize_fit_layout(mon, ws, pinned_addr)
-    pin_x, pin_y, pin_w, pin_h = pin_box
-    combined = list(targets) + [(pinned_addr, pin_x, pin_y, pin_w, pin_h)]
-    combined = extend_last_cell(mon, combined, applied, fill_dir)
-    targets = []
-    sizes = {}
-    rects = {}
-    for addr, x, y, w, h in combined:
-        rects[addr] = (x, y, w, h)
-        if addr == pinned_addr:
-            pin_x, pin_y, pin_w, pin_h = x, y, w, h
-        else:
-            targets.append((addr, x, y, w, h))
-        sizes[addr] = (w, h)
-    # Keep the pinned (resized) window's new size (clamping only if it would
-    # overflow the region) and move its box fully on-screen, since a
-    # center-anchored resize can otherwise push its top-left off-region.
-    # Phase 1: ensure every window is floating.
-    dispatch(f'hl.dsp.window.float({{ window = "address:{pinned_addr}", action = "enable" }})')
-    for addr, x, y, w, h in targets:
-        dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "enable" }})')
-    time.sleep(0.05)
-    # Phase 2: resize + move to exact positions.
-    dispatch(f'hl.dsp.window.resize({{ window = "address:{pinned_addr}", x = {pin_w}, y = {pin_h}, relative = false }})')
-    dispatch(f'hl.dsp.window.move({{ window = "address:{pinned_addr}", x = {pin_x}, y = {pin_y}, relative = false }})')
-    for addr, x, y, w, h in targets:
-        dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {w}, y = {h}, relative = false }})')
+def _give_nearest(values, indexes, amount):
+    if not indexes or amount <= 0:
+        return 0
+    first = amount // len(indexes)
+    remainder = amount % len(indexes)
+    for position, index in enumerate(indexes):
+        values[index] += first + (1 if position < remainder else 0)
+    return amount
+
+
+def resize_slot_layout(
+    rects,
+    cell_map,
+    pinned_addr,
+    requested_size,
+    minimum=MIN_TILE_SIZE,
+    minimums=None,
+):
+    """Resize one persistent slot while retaining a gap-free rectangular grid.
+
+    Width is local to the pinned slot's row. Height belongs to the complete row
+    band, preventing a tall widened tile from overlapping windows above or below.
+    Neighboring slots absorb growth from nearest to farthest.
+    """
+    if pinned_addr not in rects or pinned_addr not in cell_map:
+        return dict(rects)
+
+    minimums = minimums or {}
+    updated = dict(rects)
+    cols = max(1, math.ceil(math.sqrt(len(rects))))
+    pin_row = cell_map[pinned_addr] // cols
+    row_addrs = sorted(
+        (addr for addr in rects if cell_map.get(addr, -1) // cols == pin_row),
+        key=lambda addr: rects[addr][0],
+    )
+    pin_index = row_addrs.index(pinned_addr)
+    widths = [rects[addr][2] for addr in row_addrs]
+    min_widths = [max(minimum, minimums.get(addr, (0, 0))[0]) for addr in row_addrs]
+    old_width = widths[pin_index]
+    wanted_width = max(min_widths[pin_index], int(requested_size[0]))
+    width_delta = wanted_width - old_width
+
+    left = list(range(pin_index - 1, -1, -1))
+    right = list(range(pin_index + 1, len(widths)))
+    if width_delta > 0:
+        left_capacity = sum(max(0, widths[i] - min_widths[i]) for i in left)
+        right_capacity = sum(max(0, widths[i] - min_widths[i]) for i in right)
+        grow = min(width_delta, left_capacity + right_capacity)
+        take_left, take_right = _split_delta(grow, left_capacity, right_capacity)
+        _take_nearest(widths, left, take_left, min_widths)
+        _take_nearest(widths, right, take_right, min_widths)
+        widths[pin_index] += grow
+    elif width_delta < 0:
+        release = min(-width_delta, old_width - min_widths[pin_index])
+        recipients = ([left[0]] if left else []) + ([right[0]] if right else [])
+        if recipients:
+            _give_nearest(widths, recipients, release)
+            widths[pin_index] -= release
+
+    row_left = min(rects[addr][0] for addr in row_addrs)
+    x = row_left
+    for addr, width in zip(row_addrs, widths):
+        _, y, _, height = updated[addr]
+        updated[addr] = (x, y, width, height)
+        x += width + GRID_GAP
+
+    row_ids = sorted({cell // cols for cell in cell_map.values()})
+    row_members = {
+        row: [addr for addr in rects if cell_map.get(addr, -1) // cols == row]
+        for row in row_ids
+    }
+    row_heights = [rects[row_members[row][0]][3] for row in row_ids]
+    min_heights = [
+        max(
+            [minimum]
+            + [minimums.get(addr, (0, 0))[1] for addr in row_members[row]]
+        )
+        for row in row_ids
+    ]
+    row_index = row_ids.index(pin_row)
+    old_height = row_heights[row_index]
+    wanted_height = max(min_heights[row_index], int(requested_size[1]))
+    height_delta = wanted_height - old_height
+    above = list(range(row_index - 1, -1, -1))
+    below = list(range(row_index + 1, len(row_heights)))
+    if height_delta > 0:
+        above_capacity = sum(max(0, row_heights[i] - min_heights[i]) for i in above)
+        below_capacity = sum(max(0, row_heights[i] - min_heights[i]) for i in below)
+        grow = min(height_delta, above_capacity + below_capacity)
+        take_above, take_below = _split_delta(grow, above_capacity, below_capacity)
+        _take_nearest(row_heights, above, take_above, min_heights)
+        _take_nearest(row_heights, below, take_below, min_heights)
+        row_heights[row_index] += grow
+    elif height_delta < 0:
+        release = min(-height_delta, old_height - min_heights[row_index])
+        recipients = ([above[0]] if above else []) + ([below[0]] if below else [])
+        if recipients:
+            _give_nearest(row_heights, recipients, release)
+            row_heights[row_index] -= release
+
+    top = min(rect[1] for rect in rects.values())
+    y = top
+    for row, height in zip(row_ids, row_heights):
+        for addr in row_members[row]:
+            x, _, width, _ = updated[addr]
+            updated[addr] = (x, y, width, height)
+        y += height + GRID_GAP
+    return updated
+
+
+def apply_rects(rects, previous=None, force=None):
+    """Apply changed floating rectangles and return their size snapshot."""
+    force = set(force or ())
+    for addr, (x, y, width, height) in rects.items():
+        if addr not in force and previous and previous.get(addr) == (x, y, width, height):
+            continue
+        dispatch(f'hl.dsp.window.resize({{ window = "address:{addr}", x = {width}, y = {height}, relative = false }})')
         dispatch(f'hl.dsp.window.move({{ window = "address:{addr}", x = {x}, y = {y}, relative = false }})')
-    return applied, sizes, rects
+    return {addr: (rect[2], rect[3]) for addr, rect in rects.items()}
 
 
-def off_layout(mon, ws, expected):
-    """Addresses that drifted away from the last applied rectangle."""
+def swap_slot_layout(rects, cell_map, moved_addr, center):
+    """Move a window into the nearest persistent slot, swapping occupants."""
+    if moved_addr not in rects:
+        return dict(rects), dict(cell_map)
+    cx, cy = center
+    candidates = list(rects)
+    destination = min(
+        candidates,
+        key=lambda addr: (
+            0 if rects[addr][0] <= cx <= rects[addr][0] + rects[addr][2]
+            and rects[addr][1] <= cy <= rects[addr][1] + rects[addr][3] else 1,
+            (rects[addr][0] + rects[addr][2] / 2 - cx) ** 2
+            + (rects[addr][1] + rects[addr][3] / 2 - cy) ** 2,
+        ),
+    )
+    if destination == moved_addr:
+        return dict(rects), dict(cell_map)
+    return _swap_slots(rects, cell_map, moved_addr, destination)
+
+
+def _swap_slots(rects, cell_map, first, second):
+    new_rects = dict(rects)
+    new_rects[first], new_rects[second] = rects[second], rects[first]
+    new_map = dict(cell_map)
+    if first in new_map and second in new_map:
+        new_map[first], new_map[second] = new_map[second], new_map[first]
+    return new_rects, new_map
+
+
+def swap_directional_layout(rects, cell_map, moved_addr, center):
+    """Swap with the next occupied logical slot in the movement direction."""
+    if moved_addr not in rects or moved_addr not in cell_map:
+        return dict(rects), dict(cell_map)
+    source = rects[moved_addr]
+    sx = source[0] + source[2] / 2
+    sy = source[1] + source[3] / 2
+    dx = center[0] - sx
+    dy = center[1] - sy
+    cols = max(1, math.ceil(math.sqrt(len(rects))))
+    source_row, source_col = divmod(cell_map[moved_addr], cols)
+
+    if abs(dx) >= abs(dy):
+        direction = "right" if dx > 0 else "left"
+    else:
+        direction = "down" if dy > 0 else "up"
+    return swap_logical_layout(rects, cell_map, moved_addr, direction)
+
+
+def swap_logical_layout(rects, cell_map, moved_addr, direction):
+    """Swap with the adjacent occupied slot in an explicit direction."""
+    destination = logical_swap_target(rects, cell_map, moved_addr, direction)
+    if destination is None:
+        return dict(rects), dict(cell_map)
+    return _swap_slots(rects, cell_map, moved_addr, destination)
+
+
+def logical_swap_target(rects, cell_map, moved_addr, direction):
+    """Address in the adjacent occupied slot, or None at a grid edge."""
+    if moved_addr not in rects or moved_addr not in cell_map:
+        return None
+    source = rects[moved_addr]
+    sx = source[0] + source[2] / 2
+    cols = max(1, math.ceil(math.sqrt(len(rects))))
+    source_row, source_col = divmod(cell_map[moved_addr], cols)
+    candidates = []
+    if direction in ("left", "right"):
+        sign = 1 if direction == "right" else -1
+        for addr, cell in cell_map.items():
+            row, col = divmod(cell, cols)
+            if row == source_row and (col - source_col) * sign > 0:
+                candidates.append((abs(col - source_col), addr))
+    else:
+        sign = 1 if direction == "down" else -1
+        for addr, cell in cell_map.items():
+            row, _ = divmod(cell, cols)
+            if (row - source_row) * sign <= 0:
+                continue
+            rect = rects[addr]
+            cx = rect[0] + rect[2] / 2
+            candidates.append((abs(row - source_row), abs(cx - sx), addr))
+
+    if not candidates:
+        return None
+    return min(candidates)[-1]
+
+
+def fit_slot_constraints(rects, cell_map, constraints):
+    """Grow destination slots to observed app minima before a swap is shown."""
+    fitted = dict(rects)
+    for addr, size in constraints.items():
+        if addr not in fitted:
+            continue
+        width = max(fitted[addr][2], int(size[0]))
+        height = max(fitted[addr][3], int(size[1]))
+        fitted = resize_slot_layout(
+            fitted, cell_map, addr, (width, height), minimums=constraints
+        )
+    return fitted
+
+
+def moved_layout(mon, ws, expected):
+    """Addresses whose position drifted away from the last applied slot."""
     if not expected:
         return set()
     off = set()
@@ -1009,13 +1106,9 @@ def off_layout(mon, ws, expected):
         exp_x, exp_y, exp_w, exp_h = expected[addr]
         act_x = int(w["at"][0])
         act_y = int(w["at"][1])
-        act_w = int(w["size"][0])
-        act_h = int(w["size"][1])
         dx = abs(act_x - exp_x)
         dy = abs(act_y - exp_y)
-        dw = abs(act_w - exp_w)
-        dh = abs(act_h - exp_h)
-        if max(dx, dy, dw, dh) > MOVE_THRESHOLD:
+        if max(dx, dy) > MOVE_THRESHOLD:
             off.add(addr)
     return off
 
@@ -1111,18 +1204,48 @@ def run_daemon():
         if os.environ.get("EQUALIZE_DEBUG"):
             print(f"DBG refusing to read untrusted socket {SOCKET!r}", file=sys.stderr, flush=True)
         return
-    reset_state()
+    if not os.environ.get("EQUALIZE_PRESERVE_STATE"):
+        reset_state()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.connect(SOCKET)
     except OSError:
         sock.close()
         return
+    move_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    move_socket_inode = None
+    try:
+        runtime_info = os.stat(RUNTIME_DIR)
+        if (
+            os.path.realpath(RUNTIME_DIR) != os.path.abspath(RUNTIME_DIR)
+            or not stat.S_ISDIR(runtime_info.st_mode)
+            or runtime_info.st_uid != os.getuid()
+            or runtime_info.st_mode & 0o022
+        ):
+            raise OSError("refusing unsafe runtime directory")
+        try:
+            existing = os.lstat(MOVE_SOCKET)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if not stat.S_ISSOCK(existing.st_mode) or existing.st_uid != os.getuid():
+                raise OSError("refusing unsafe move socket path")
+            os.unlink(MOVE_SOCKET)
+        move_sock.bind(MOVE_SOCKET)
+        os.chmod(MOVE_SOCKET, 0o600)
+        move_socket_inode = os.lstat(MOVE_SOCKET).st_ino
+    except OSError:
+        move_sock.close()
+        move_sock = None
+
+    release_on_start = os.environ.get("EQUALIZE_RELEASE_WORKSPACE")
+    if release_on_start and release_on_start.lstrip("-").isdigit():
+        release_ws(int(release_on_start))
 
     now = time.monotonic()
     fill_dir = get_config_choice("fill_remainder")
     last_fill = fill_dir        # fill direction value we last acted on
-    stretch_state = (None, None)  # (addr, dir) of tile we last stretched in place
+    stretch_state = (None, None, None)  # (address, direction, pre-stretch rect)
     last_apply = 0.0         # monotonic time we last applied a layout
     pending_apply = []       # [(due_time, ws), ...] queued event re-applies
     fill_suppress_until = 0.0  # ignore our own fill-change events before this time
@@ -1130,9 +1253,11 @@ def run_daemon():
     current_map = {}         # address -> cell index of the layout we last applied
     current_rects = {}       # address -> (x, y, w, h) we last applied
     last_sizes = {}          # address -> (w, h) we last applied
-    resized_seen = set()     # addresses we already pinned+refit for one size change
+    minimum_sizes = {}       # address -> app minimum dimensions observed on refusal
     grids = set()            # workspace ids currently gridded/preserved
     grid_members = {}        # workspace id -> set of addresses its grid covers
+    workspace_states = {}    # workspace id -> persistent custom layout state
+    active_state_ws = None
     pending_events = deque() # socket events awaiting processing (bounded per tick)
 
     def snap_sizes(mon, ws):
@@ -1141,28 +1266,68 @@ def run_daemon():
             for w in current_rows(mon, ws)
         }
 
+    def save_active_state():
+        if active_state_ws is None:
+            return
+        workspace_states[active_state_ws] = {
+            "map": dict(current_map),
+            "rects": dict(current_rects),
+            "sizes": dict(last_sizes),
+            "minimums": dict(minimum_sizes),
+            "stretch": stretch_state,
+            "off": off_state,
+        }
+
+    def activate_state(ws):
+        nonlocal active_state_ws, current_map, current_rects, last_sizes
+        nonlocal minimum_sizes, stretch_state, off_state
+        if ws == active_state_ws:
+            return
+        save_active_state()
+        active_state_ws = ws
+        state = workspace_states.get(ws, {})
+        current_map = dict(state.get("map", {}))
+        current_rects = dict(state.get("rects", {}))
+        last_sizes = dict(state.get("sizes", {}))
+        minimum_sizes = dict(state.get("minimums", {}))
+        stretch_state = state.get("stretch", (None, None, None))
+        off_state = state.get("off", (None, None))
+
     def reapply(mon, ws, prio=None, force_first=None):
         """Apply the equal grid and refresh tracking. Returns the cell map."""
-        nonlocal last_sizes, resized_seen, current_rects, stretch_state, grid_members
-        m, s, rects = apply_grid(mon, ws, prio, fill_dir, force_first)
+        nonlocal current_map, last_sizes, current_rects, stretch_state, grid_members
+        m, s, rects, applied_stretch = apply_grid(
+            mon, ws, prio, fill_dir, force_first
+        )
+        current_map = m
         last_sizes = s
         current_rects = rects
-        resized_seen = set()
         grid_members[ws] = set(m)
         # The fresh grid already incorporates any stretch via extend_last_cell.
-        target_cell = fill_target_cell(mon, ws, fill_dir)
-        addr = next((a for a, c in m.items() if c == target_cell), None) if target_cell is not None else None
-        stretch_state = (addr, fill_dir) if addr else (None, None)
+        stretch_state = applied_stretch
+        save_active_state()
         return m
+
+    def reapply_workspace(mon, ws, prio=None, force_first=None):
+        previous_ws = active_state_ws
+        activate_state(ws)
+        result = reapply(mon, ws, prio, force_first)
+        save_active_state()
+        if previous_ws != ws:
+            activate_state(previous_ws)
+        return result
 
     def grid_if_needed(ws):
         """Grid `ws` if it is marked equalized and not yet gridded. Returns mon."""
-        nonlocal current_map, last_sizes, resized_seen, last_apply, current_rects
+        nonlocal current_map, last_sizes, last_apply, current_rects
         mon, cur = monitor_and_ws()
         if mon is None:
             return None
+        activate_state(ws)
         wanted = load_wanted()
-        if ws in wanted and ws not in grids:
+        rows = current_rows(mon, ws) if ws in wanted else []
+        needs_repair = any(not window.get("floating") for window in rows)
+        if ws in wanted and (ws not in grids or needs_repair):
             # The window under the cursor anchors the grid's top-left cell on
             # the initial equalize; the rest settle into nearest cells as normal.
             # Re-grids after drag/resize events deliberately do NOT use this.
@@ -1170,6 +1335,79 @@ def run_daemon():
             grids.add(ws)
             last_apply = now
         return mon
+
+    def probe_minimums(mon, ws, rects):
+        nonlocal minimum_sizes
+        for addr, (_x, _y, width, height) in rects.items():
+            dispatch(
+                f'hl.dsp.window.resize({{ window = "address:{addr}", x = {width}, y = {height}, relative = false }})'
+            )
+        time.sleep(0.05)
+        measured = snap_sizes(mon, ws)
+        for addr, (_x, _y, requested_width, requested_height) in rects.items():
+            if addr not in measured:
+                continue
+            actual_width, actual_height = measured[addr]
+            old_minimum = minimum_sizes.get(addr, (0, 0))
+            observed = (
+                max(
+                    old_minimum[0],
+                    actual_width if actual_width > requested_width + 4 else 0,
+                ),
+                max(
+                    old_minimum[1],
+                    actual_height if actual_height > requested_height + 4 else 0,
+                ),
+            )
+            if observed != (0, 0):
+                minimum_sizes[addr] = observed
+
+    def snap_to_slot(mon, ws, moved_addr, directional=False):
+        """Snap one moved window into its nearest slot and preserve slot sizing."""
+        nonlocal current_map, current_rects, last_sizes, stretch_state
+        moved = next(
+            (w for w in current_rows(mon, ws) if w["address"] == moved_addr),
+            None,
+        )
+        if moved is None or not current_map:
+            return False
+        cx = moved["at"][0] + moved["size"][0] / 2
+        cy = moved["at"][1] + moved["size"][1] / 2
+        swap_layout = swap_directional_layout if directional else swap_slot_layout
+        base_rects = remove_stretch(current_rects, stretch_state)
+        rects, cell_map = swap_layout(base_rects, current_map, moved_addr, (cx, cy))
+        rects, stretch_state = fill_layout(mon, ws, rects, cell_map, fill_dir)
+        probe_minimums(mon, ws, rects)
+        base_rects = remove_stretch(rects, stretch_state)
+        rects = fit_slot_constraints(base_rects, cell_map, minimum_sizes)
+        rects, stretch_state = fill_layout(mon, ws, rects, cell_map, fill_dir)
+        last_sizes = apply_rects(rects, current_rects, (moved_addr,))
+        current_rects = rects
+        current_map = cell_map
+        return True
+
+    def apply_directional_move(mon, ws, moved_addr, direction):
+        """Preflight destination sizes, then apply an adjusted swap immediately."""
+        nonlocal current_map, current_rects, last_sizes, minimum_sizes, stretch_state
+        base_rects = remove_stretch(current_rects, stretch_state)
+        destination = logical_swap_target(
+            base_rects, current_map, moved_addr, direction
+        )
+        if destination is None:
+            return False
+        rects, cell_map = _swap_slots(
+            base_rects, current_map, moved_addr, destination
+        )
+        rects, next_stretch = fill_layout(mon, ws, rects, cell_map, fill_dir)
+        participants = (moved_addr, destination)
+        probe_minimums(mon, ws, rects)
+        base_rects = remove_stretch(rects, next_stretch)
+        rects = fit_slot_constraints(base_rects, cell_map, minimum_sizes)
+        rects, stretch_state = fill_layout(mon, ws, rects, cell_map, fill_dir)
+        last_sizes = apply_rects(rects, current_rects, participants)
+        current_rects = rects
+        current_map = cell_map
+        return True
 
     try:
         while True:
@@ -1182,26 +1420,32 @@ def run_daemon():
             # If the stretch direction changed while a grid is active, adjust the
             # affected tile(s) in place instead of re-laying-out the whole grid.
             if fill_dir != last_fill:
-                mon_f, cur_f = monitor_and_ws()
-                if mon_f is not None and cur_f in grids and current_rects:
-                    mon_f, cur_f = monitor_and_ws()
+                previous_ws = active_state_ws
+                for wid in list(grids):
                     try:
+                        mon_f = monitor_for_workspace(wid)
+                        if mon_f is None:
+                            continue
+                        activate_state(wid)
+                        if not current_rects:
+                            continue
                         if os.environ.get("EQUALIZE_DEBUG"):
-                            print(f"DBG fill change {last_fill}->{fill_dir} ws={cur_f} rects={len(current_rects)} cmap={len(current_map)} prev={stretch_state}", file=sys.stderr, flush=True)
+                            print(f"DBG fill change {last_fill}->{fill_dir} ws={wid} rects={len(current_rects)} cmap={len(current_map)} prev={stretch_state}", file=sys.stderr, flush=True)
                         new_rects, stretch_state = apply_fill_in_place(
-                            mon_f, cur_f, fill_dir, current_rects, current_map, stretch_state
+                            mon_f, wid, fill_dir, current_rects, current_map, stretch_state
                         )
                         current_rects = new_rects
                         # Refresh sizes snapshot so the resize detector does not
                         # mistake our own stretch for a user resize and re-fit the
                         # whole grid on top of it.
                         last_sizes = {a: (r[2], r[3]) for a, r in new_rects.items()}
-                        last_apply = now
                         off_state = (None, None)
-                        pending_apply = []
-                        fill_suppress_until = now + GRACE
+                        save_active_state()
                     except Exception:
                         traceback.print_exc()
+                activate_state(previous_ws)
+                last_apply = now
+                fill_suppress_until = now + GRACE
                 last_fill = fill_dir
 
             # Release grids that are no longer marked equalized (toggle OFF).
@@ -1212,13 +1456,13 @@ def run_daemon():
                     restore_snapshot(wid)
                     grids.discard(wid)
                     grid_members.pop(wid, None)
-                    current_map = {}
-                    current_rects = {}
-                    stretch_state = (None, None)
-                    off_state = (None, None)
+                    if active_state_ws == wid:
+                        activate_state(None)
+                    workspace_states.pop(wid, None)
 
             mon, cur = monitor_and_ws()
             if mon is not None:
+                activate_state(cur)
                 # Grid the active workspace if it is currently marked equalized.
                 grid_if_needed(cur)
 
@@ -1227,59 +1471,134 @@ def run_daemon():
             if pending_apply:
                 due = min(d for d, _w in pending_apply)
                 if now >= due:
-                    mon, acur = monitor_and_ws()
-                    if mon is not None:
-                        for _due, wid in pending_apply:
-                            if _due <= now and wid in grids:
-                                current_map = reapply(mon, wid)
+                    remaining_apply = []
+                    for _due, wid in pending_apply:
+                        if _due > now:
+                            remaining_apply.append((_due, wid))
+                            continue
+                        if wid in grids:
+                            target_mon = monitor_for_workspace(wid)
+                            if target_mon is not None:
+                                reapply_workspace(target_mon, wid)
                                 last_apply = now
-                    pending_apply = []
+                            else:
+                                remaining_apply.append(
+                                    (now + EVENT_DEBOUNCE, wid)
+                                )
+                    pending_apply = remaining_apply
 
             # 2) Drag-drop / resize detection on the active gridded workspace.
             if mon is not None and cur in grids and now - last_apply > GRACE:
                 try:
                     sizes_now = snap_sizes(mon, cur)
-                    # 2a) A window was resized (SUPER +/-): pinch it and re-fit the
-                    #     others to the leftover space. Only for the focused window.
                     foc = focused_address()
+                    size_changed = False
+                    if foc and foc in sizes_now and foc in last_sizes:
+                        w0, h0 = last_sizes[foc]
+                        w1, h1 = sizes_now[foc]
+                        size_changed = abs(w1 - w0) + abs(h1 - h0) >= 6
+
+                    # A keyboard swap moves two windows. A keyboard resize can
+                    # move one edge as well as changing size, so a single moved
+                    # focused window with a size delta remains a resize.
+                    moved = moved_layout(mon, cur, current_rects)
+                    if moved:
+                        if (
+                            len(moved) == 2
+                            and foc in moved
+                            and snap_to_slot(mon, cur, foc, directional=True)
+                        ):
+                            last_apply = now
+                            off_state = (None, None)
+                            continue
+                        if not (len(moved) == 1 and foc in moved and size_changed):
+                            seen, since = off_state
+                            if seen == moved:
+                                if now - since >= STABLE:
+                                    moved_addr = next(iter(moved)) if len(moved) == 1 else None
+                                    if not snap_to_slot(mon, cur, moved_addr):
+                                        current_map = reapply(mon, cur, list(moved))
+                                    last_apply = now
+                                    off_state = (None, None)
+                            else:
+                                off_state = (moved, now)
+                            continue
+                    else:
+                        off_state = (None, None)
+
+                    # 2b) Resize the focused slot. Width stays local to its row;
+                    #     height rebalances complete row bands to avoid overlap.
                     if (
                         foc
                         and foc in sizes_now
                         and foc in last_sizes
-                        and foc not in resized_seen
+                        and foc in current_rects
+                        and foc in current_map
                     ):
-                        w0, h0 = last_sizes[foc]
-                        w1, h1 = sizes_now[foc]
-                        if abs(w1 - w0) + abs(h1 - h0) >= 6:
-                            _, s, rects = apply_resize_fit(mon, cur, foc, fill_dir)
-                            last_sizes = s
+                        if size_changed:
+                            base_rects = remove_stretch(current_rects, stretch_state)
+                            expected = current_rects[foc]
+                            base = base_rects[foc]
+                            requested = (
+                                base[2] + (w1 - expected[2]),
+                                base[3] + (h1 - expected[3]),
+                            )
+                            rects = resize_slot_layout(
+                                base_rects, current_map, foc, requested,
+                                minimums=minimum_sizes,
+                            )
+                            probe_minimums(mon, cur, rects)
+                            rects = fit_slot_constraints(
+                                rects, current_map, minimum_sizes
+                            )
+                            rects, stretch_state = fill_layout(
+                                mon, cur, rects, current_map, fill_dir
+                            )
+                            last_sizes = apply_rects(rects, current_rects, (foc,))
                             current_rects = rects
-                            resized_seen.add(foc)
-                            current_map = {}
-                            grid_members[cur] = set(rects)
-                            stretch_state = (None, None)
+                            grid_members[cur] = set(current_rects)
                             last_apply = now
                             off_state = (None, None)
                             continue
-                    # 2b) Drag-drop detection (a window moved to a different cell).
-                    off = off_layout(mon, cur, current_rects)
-                    if off:
-                        seen, since = off_state
-                        if seen == off:
-                            if now - since >= STABLE:
-                                current_map = reapply(mon, cur, list(off))
-                                last_apply = now
-                                off_state = (None, None)
-                        else:
-                            off_state = (off, now)
-                    else:
-                        off_state = (None, None)
                 except Exception:
                     traceback.print_exc()
 
             # 3) Read available socket events into the pending queue. Each
             # recv is capped (16 KiB) and only ever appended to the queue.
-            r, _, _ = select.select([sock], [], [], POLL)
+            readers = [sock] + ([move_sock] if move_sock is not None else [])
+            r, _, _ = select.select(readers, [], [], POLL)
+            if move_sock is not None and move_sock in r:
+                try:
+                    request = json.loads(move_sock.recv(512).decode("ascii"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    request = {}
+                direction = request.get("direction") if isinstance(request, dict) else None
+                request_ws = request.get("workspace") if isinstance(request, dict) else None
+                request_addr = normalize_address(
+                    request.get("address") if isinstance(request, dict) else None
+                )
+                sent = request.get("sent") if isinstance(request, dict) else None
+                request_age = (
+                    time.monotonic() - sent
+                    if isinstance(sent, (int, float))
+                    else float("inf")
+                )
+                move_mon, move_ws = monitor_and_ws()
+                if move_mon is not None:
+                    activate_state(move_ws)
+                foc = focused_address()
+                if (
+                    direction in ("left", "right", "up", "down")
+                    and request_ws == move_ws
+                    and move_ws in grids
+                    and request_addr == foc
+                    and 0 <= request_age <= 1.0
+                ):
+                    if apply_directional_move(
+                        move_mon, move_ws, request_addr, direction
+                    ):
+                        last_apply = time.monotonic()
+                        off_state = (None, None)
             if sock in r:
                 try:
                     data = sock.recv(16384).decode("utf-8", "ignore")
@@ -1300,6 +1619,7 @@ def run_daemon():
                 mon, cur = monitor_and_ws()
                 if mon is None:
                     continue
+                activate_state(cur)
                 # If the active workspace changed to a newly equalized one that
                 # isn't gridded yet, grid it. Desktops already gridded stay
                 # preserved (we never released them on switch-away).
@@ -1352,14 +1672,43 @@ def run_daemon():
                             schedule = (now + EVENT_DEBOUNCE, source_ws)
                             if schedule not in pending_apply:
                                 pending_apply.append(schedule)
+                elif line.startswith("openwindow>>") and not suppressed:
+                    addr = normalize_address(
+                        line[len("openwindow>>"):].split(",", 1)[0]
+                    )
+                    opened = next(
+                        (
+                            window
+                            for window in hyprctl_json(["clients", "-j"])
+                            if isinstance(window, dict)
+                            and normalize_address(window.get("address")) == addr
+                        ),
+                        None,
+                    )
+                    opened_ws = (
+                        (opened.get("workspace") or {}).get("id")
+                        if opened is not None
+                        else None
+                    )
+                    if opened_ws in grids:
+                        pending_apply.append((now + EVENT_DEBOUNCE, opened_ws))
+                elif line.startswith("closewindow>>") and not suppressed:
+                    addr = normalize_address(line[len("closewindow>>"):].split(",", 1)[0])
+                    closed_ws = next(
+                        (
+                            wid
+                            for wid, members in grid_members.items()
+                            if addr in members
+                        ),
+                        None,
+                    )
+                    if closed_ws in grids:
+                        pending_apply.append((now + EVENT_DEBOUNCE, closed_ws))
                 elif cur in grids:
                     if line.startswith("movewindow>>") and not suppressed and not self_applied:
-                        addr = normalize_address(line[len("movewindow>>"):].split(",")[0])
-                        if addr:
-                            dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
-                        pending_apply.append((now + EVENT_DEBOUNCE, cur))
-                    elif line.startswith(("openwindow>>", "closewindow>>")) and not suppressed:
-                        pending_apply.append((now + EVENT_DEBOUNCE, cur))
+                        # Position changes are handled by polling and explicit
+                        # move requests. Workspace transfers use movewindowv2.
+                        pass
                     elif line.startswith("changefloatingmode>>") and not suppressed and not self_applied:
                         pending_apply.append((now + EVENT_DEBOUNCE, cur))
     finally:
@@ -1367,6 +1716,17 @@ def run_daemon():
             sock.close()
         except OSError:
             pass
+        if move_sock is not None:
+            try:
+                move_sock.close()
+            except OSError:
+                pass
+            try:
+                current = os.lstat(MOVE_SOCKET)
+                if stat.S_ISSOCK(current.st_mode) and current.st_ino == move_socket_inode:
+                    os.unlink(MOVE_SOCKET)
+            except OSError:
+                pass
 
 
 def parse_args():

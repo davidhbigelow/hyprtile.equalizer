@@ -81,7 +81,7 @@ def watcher_is_running() -> bool:
     return True
 
 
-def ensure_watcher_running() -> None:
+def ensure_watcher_running(release_workspace=None) -> None:
     if not os.path.exists(HYPR_SOCKET):
         return
     if watcher_is_running():
@@ -91,6 +91,9 @@ def ensure_watcher_running() -> None:
         return
     env = os.environ.copy()
     env["PATH"] = "/usr/bin"
+    env["EQUALIZE_PRESERVE_STATE"] = "1"
+    if release_workspace is not None:
+        env["EQUALIZE_RELEASE_WORKSPACE"] = str(int(release_workspace))
     try:
         subprocess.Popen(
             [PYTHON, watcher],
@@ -111,7 +114,7 @@ def main() -> int:
         print("0")
         return 0
     enabled = toggle_workspace_id(wid)
-    ensure_watcher_running()
+    ensure_watcher_running(None if enabled else wid)
     print("1" if enabled else "0")
     return 0
 

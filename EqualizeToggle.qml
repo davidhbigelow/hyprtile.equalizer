@@ -15,7 +15,7 @@ Panel {
   property bool refreshPending: false
   property string focusSection: "header"
   property bool cursorActive: false
-  readonly property string pluginVersion: "1.2.2"
+  readonly property string pluginVersion: "1.3.0"
 
   readonly property string scriptsDir: {
     var url = Qt.resolvedUrl("scripts")

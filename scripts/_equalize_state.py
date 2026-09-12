@@ -12,12 +12,14 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import tempfile
+import pwd
+import secrets
+import stat
 import time
 from typing import Callable, Iterable, Optional, Set
 
 STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.join(
-    os.path.expanduser("~"), ".local", "state"
+    pwd.getpwuid(os.getuid()).pw_dir, ".local", "state"
 )
 STATE_DIR = os.path.join(STATE_HOME, "hyprtile.equalizer")
 WORKSPACE_FILE = os.path.join(STATE_DIR, "equalized-workspaces")
@@ -50,21 +52,83 @@ def _secure_flags(flags: int) -> int:
     return flags
 
 
-def _ensure_state_dir() -> None:
-    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+def _open_state_dir(create: bool = True) -> int:
+    """Open the private state directory without following any path symlink."""
+    path = os.path.abspath(STATE_DIR)
+    if not path.startswith(os.sep):
+        raise OSError("state directory must be absolute")
+    uid = os.getuid()
+    fd = os.open(os.sep, _secure_flags(os.O_RDONLY | os.O_DIRECTORY))
     try:
-        st_mode = os.stat(STATE_DIR).st_mode & 0o777
-        if st_mode != 0o700:
-            os.chmod(STATE_DIR, 0o700)
-    except OSError:
-        pass
+        for component in (part for part in path.split(os.sep) if part):
+            try:
+                child = os.open(
+                    component,
+                    _secure_flags(os.O_RDONLY | os.O_DIRECTORY),
+                    dir_fd=fd,
+                )
+            except FileNotFoundError:
+                if not create:
+                    os.close(fd)
+                    return -1
+                os.mkdir(component, 0o700, dir_fd=fd)
+                child = os.open(
+                    component,
+                    _secure_flags(os.O_RDONLY | os.O_DIRECTORY),
+                    dir_fd=fd,
+                )
+            info = os.fstat(child)
+            writable = info.st_mode & 0o022
+            sticky_root = info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid not in (0, uid)
+                or (writable and not sticky_root)
+            ):
+                os.close(child)
+                raise OSError("unsafe state directory component")
+            os.close(fd)
+            fd = child
+        final = os.fstat(fd)
+        if final.st_uid != uid:
+            raise OSError("state directory must be user-owned")
+        os.fchmod(fd, 0o700)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
 
 
-def _atomic_write(path: str, text: str, max_bytes: int) -> bool:
-    """Write `text` to `path` atomically and enforce a size cap.
+def _open_regular(dir_fd: int, name: str, flags: int, mode: int = 0o600) -> int:
+    fd = os.open(name, _secure_flags(flags), mode, dir_fd=dir_fd)
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_nlink != 1
+        or info.st_mode & 0o022
+    ):
+        os.close(fd)
+        raise OSError(f"unsafe state file: {name}")
+    return fd
 
-    The bytes are staged as an unpredictable `mkstemp` file (0600) in the
-    private state dir, fsync'd, then atomically `os.replace`'d over `path`.
+
+def _read_file(dir_fd: int, name: str, max_bytes: int) -> str:
+    try:
+        fd = _open_regular(dir_fd, name, os.O_RDONLY)
+    except FileNotFoundError:
+        return ""
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        data = handle.read(max_bytes + 1)
+    return data if len(data) <= max_bytes else ""
+
+
+def _atomic_write(dir_fd: int, name: str, text: str, max_bytes: int) -> bool:
+    """Write `text` to `name` atomically and enforce a size cap.
+
+    The bytes are staged under an unpredictable exclusive name (0600) in the
+    open private-state descriptor, fsync'd, then published with a
+    descriptor-relative `os.replace`.
     This guarantees a reader never observes a truncated or torn file even if
     the process crashes mid-write, and prevents an unbounded payload from ever
     being persisted. Returns False (and leaves `path` untouched) if the payload
@@ -73,21 +137,24 @@ def _atomic_write(path: str, text: str, max_bytes: int) -> bool:
     encoded = text.encode("utf-8")
     if len(encoded) > max_bytes:
         return False
-    _ensure_state_dir()
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=STATE_DIR, prefix="tmp-", text=False)
+    tmp_name = f".tmp-{secrets.token_hex(16)}"
+    tmp_fd = _open_regular(
+        dir_fd, tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+    )
     try:
         os.fchmod(tmp_fd, 0o600)
         with os.fdopen(tmp_fd, "wb") as tmp:
             tmp.write(encoded)
             tmp.flush()
             os.fsync(tmp.fileno())
-        os.replace(tmp_path, path)
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
         return True
     except OSError:
         return False
     finally:
         try:
-            os.remove(tmp_path)
+            os.unlink(tmp_name, dir_fd=dir_fd)
         except FileNotFoundError:
             pass
 
@@ -107,21 +174,18 @@ def _parse_ids(raw: str) -> Set[int]:
 
 
 def _read_ids(lock_type: Optional[int]) -> Set[int]:
-    _ensure_state_dir()
+    dir_fd = _open_state_dir()
     data = ""
     try:
-        lock_fd = os.open(WORKSPACE_LOCK, _secure_flags(os.O_RDWR | os.O_CREAT), 0o600)
+        lock_fd = _open_regular(
+            dir_fd, os.path.basename(WORKSPACE_LOCK), os.O_RDWR | os.O_CREAT
+        )
     except OSError:
         lock_fd = None
     try:
         if lock_type is not None and lock_fd is not None:
             fcntl.flock(lock_fd, lock_type)
-        try:
-            fd = os.open(WORKSPACE_FILE, _secure_flags(os.O_RDONLY))
-        except FileNotFoundError:
-            return set()
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            data = handle.read(MAX_SET_BYTES + 1)
+        data = _read_file(dir_fd, os.path.basename(WORKSPACE_FILE), MAX_SET_BYTES)
     finally:
         if lock_fd is not None:
             try:
@@ -129,8 +193,7 @@ def _read_ids(lock_type: Optional[int]) -> Set[int]:
                 os.close(lock_fd)
             except OSError:
                 pass
-    if len(data) > MAX_SET_BYTES:
-        return set()
+        os.close(dir_fd)
     return _parse_ids(data)
 
 
@@ -141,8 +204,14 @@ def load_workspace_ids() -> Set[int]:
 
 
 def _update_ids(mutator: Callable[[Set[int]], Set[int]]) -> Set[int]:
-    _ensure_state_dir()
-    lock_fd = os.open(WORKSPACE_LOCK, _secure_flags(os.O_RDWR | os.O_CREAT), 0o600)
+    dir_fd = _open_state_dir()
+    try:
+        lock_fd = _open_regular(
+            dir_fd, os.path.basename(WORKSPACE_LOCK), os.O_RDWR | os.O_CREAT
+        )
+    except Exception:
+        os.close(dir_fd)
+        raise
     try:
         os.fchmod(lock_fd, 0o600)
     except OSError:
@@ -150,27 +219,22 @@ def _update_ids(mutator: Callable[[Set[int]], Set[int]]) -> Set[int]:
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
-            fd = os.open(WORKSPACE_FILE, _secure_flags(os.O_RDONLY))
-        except FileNotFoundError:
+            data = _read_file(dir_fd, os.path.basename(WORKSPACE_FILE), MAX_SET_BYTES)
+        except OSError:
             data = ""
-        else:
-            with os.fdopen(fd, "r", encoding="utf-8") as handle:
-                data = handle.read(MAX_SET_BYTES + 1)
-        if len(data) > MAX_SET_BYTES:
-            ids = set()
-        else:
-            ids = _parse_ids(data)
+        ids = _parse_ids(data)
         new_ids = mutator(set(ids))
         body = ""
         if new_ids:
             body = "\n".join(str(i) for i in sorted(new_ids)) + "\n"
-        _atomic_write(WORKSPACE_FILE, body, MAX_SET_BYTES)
+        _atomic_write(dir_fd, os.path.basename(WORKSPACE_FILE), body, MAX_SET_BYTES)
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
         except OSError:
             pass
+        os.close(dir_fd)
     return new_ids
 
 
@@ -210,9 +274,14 @@ def workspace_is_equalized(workspace_id: int) -> bool:
 def acquire_watcher_lock() -> int:
     """Return an exclusive-lock fd that enforces a single watcher instance."""
 
-    _ensure_state_dir()
+    dir_fd = _open_state_dir()
     flags = _secure_flags(os.O_RDWR | os.O_CREAT)
-    fd = os.open(LOCK_FILE, flags, 0o600)
+    try:
+        fd = _open_regular(dir_fd, os.path.basename(LOCK_FILE), flags, 0o600)
+    except Exception:
+        os.close(dir_fd)
+        raise
+    os.close(dir_fd)
     try:
         os.fchmod(fd, 0o600)
     except OSError:
@@ -253,40 +322,28 @@ def proc_start_time(pid: int) -> Optional[int]:
 
 
 def write_pid_record(pid: int, script_path: str) -> None:
-    _ensure_state_dir()
     record = {
         "pid": int(pid),
         "script": os.path.realpath(script_path),
         "start": proc_start_time(pid),
         "timestamp": time.time(),
     }
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=STATE_DIR, prefix="pid-", text=True)
+    payload = json.dumps(record) + "\n"
+    dir_fd = _open_state_dir()
     try:
-        os.fchmod(tmp_fd, 0o600)
-    except OSError:
-        pass
-    try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp:
-            json.dump(record, tmp)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        os.replace(tmp_path, PID_FILE)
+        _atomic_write(dir_fd, os.path.basename(PID_FILE), payload, MAX_PID_BYTES)
     finally:
-        try:
-            os.remove(tmp_path)
-        except FileNotFoundError:
-            pass
+        os.close(dir_fd)
 
 
 def read_pid_record() -> Optional[dict]:
+    dir_fd = _open_state_dir(create=False)
+    if dir_fd < 0:
+        return None
     try:
-        fd = os.open(PID_FILE, _secure_flags(os.O_RDONLY))
-    except FileNotFoundError:
-        return None
-    with os.fdopen(fd, "r", encoding="utf-8") as handle:
-        data = handle.read(MAX_PID_BYTES + 1)
-    if len(data) > MAX_PID_BYTES:
-        return None
+        data = _read_file(dir_fd, os.path.basename(PID_FILE), MAX_PID_BYTES)
+    finally:
+        os.close(dir_fd)
     try:
         record = json.loads(data)
     except json.JSONDecodeError:
@@ -308,29 +365,36 @@ def read_pid_record() -> Optional[dict]:
 
 
 def remove_pid_record() -> None:
+    dir_fd = _open_state_dir(create=False)
+    if dir_fd < 0:
+        return
     try:
-        os.unlink(PID_FILE)
-    except FileNotFoundError:
-        pass
+        try:
+            os.unlink(os.path.basename(PID_FILE), dir_fd=dir_fd)
+            os.fsync(dir_fd)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(dir_fd)
 
 
 def load_config() -> dict:
-    _ensure_state_dir()
+    dir_fd = _open_state_dir()
     data = ""
     lock_fd = None
     try:
-        lock_fd = os.open(CONFIG_LOCK, _secure_flags(os.O_RDWR | os.O_CREAT), 0o600)
+        lock_fd = _open_regular(
+            dir_fd, os.path.basename(CONFIG_LOCK), os.O_RDWR | os.O_CREAT
+        )
     except OSError:
         pass
     try:
         if lock_fd is not None:
             fcntl.flock(lock_fd, fcntl.LOCK_SH)
         try:
-            fd = os.open(CONFIG_FILE, _secure_flags(os.O_RDONLY))
-        except FileNotFoundError:
-            return dict(CONFIG_DEFAULTS)
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            data = handle.read(MAX_CONFIG_BYTES + 1)
+            data = _read_file(dir_fd, os.path.basename(CONFIG_FILE), MAX_CONFIG_BYTES)
+        except OSError:
+            data = ""
     finally:
         if lock_fd is not None:
             try:
@@ -338,8 +402,7 @@ def load_config() -> dict:
                 os.close(lock_fd)
             except OSError:
                 pass
-    if len(data) > MAX_CONFIG_BYTES:
-        return dict(CONFIG_DEFAULTS)
+        os.close(dir_fd)
     try:
         raw = json.loads(data) if data else {}
     except json.JSONDecodeError:
@@ -354,8 +417,14 @@ def load_config() -> dict:
 
 
 def _update_config(mutator: Callable[[dict], dict]) -> dict:
-    _ensure_state_dir()
-    lock_fd = os.open(CONFIG_LOCK, _secure_flags(os.O_RDWR | os.O_CREAT), 0o600)
+    dir_fd = _open_state_dir()
+    try:
+        lock_fd = _open_regular(
+            dir_fd, os.path.basename(CONFIG_LOCK), os.O_RDWR | os.O_CREAT
+        )
+    except Exception:
+        os.close(dir_fd)
+        raise
     try:
         os.fchmod(lock_fd, 0o600)
     except OSError:
@@ -364,12 +433,9 @@ def _update_config(mutator: Callable[[dict], dict]) -> dict:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         data = ""
         try:
-            fd = os.open(CONFIG_FILE, _secure_flags(os.O_RDONLY))
-        except FileNotFoundError:
-            pass
-        else:
-            with os.fdopen(fd, "r", encoding="utf-8") as handle:
-                data = handle.read(MAX_CONFIG_BYTES + 1)
+            data = _read_file(dir_fd, os.path.basename(CONFIG_FILE), MAX_CONFIG_BYTES)
+        except OSError:
+            data = ""
         try:
             raw = json.loads(data) if data else {}
         except json.JSONDecodeError:
@@ -384,13 +450,14 @@ def _update_config(mutator: Callable[[dict], dict]) -> dict:
         if not isinstance(new_cfg, dict):
             new_cfg = dict(CONFIG_DEFAULTS)
         payload = json.dumps(new_cfg) + "\n"
-        _atomic_write(CONFIG_FILE, payload, MAX_CONFIG_BYTES)
+        _atomic_write(dir_fd, os.path.basename(CONFIG_FILE), payload, MAX_CONFIG_BYTES)
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
         except OSError:
             pass
+        os.close(dir_fd)
     return new_cfg
 
 
@@ -454,8 +521,8 @@ def cycle_config_choice(key: str, choices: tuple = FILL_CHOICES, default: str = 
     return next_value
 
 
-def _snapshot_path(workspace_id: int) -> str:
-    return os.path.join(STATE_DIR, f"snapshot-{int(workspace_id)}.json")
+def _snapshot_name(workspace_id: int) -> str:
+    return f"snapshot-{int(workspace_id)}.json"
 
 
 def save_snapshot(workspace_id: int, entries) -> None:
@@ -465,7 +532,6 @@ def save_snapshot(workspace_id: int, entries) -> None:
     each with keys: address, floating, x, y, w, h. Stored atomically in the
     private state dir so a shell/compositor restart does not lose the layout.
     """
-    _ensure_state_dir()
     payload = [
         {
             "address": str(e.get("address", "")),
@@ -477,35 +543,25 @@ def save_snapshot(workspace_id: int, entries) -> None:
         }
         for e in entries
     ]
-    data = json.dumps(payload)
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=STATE_DIR, prefix="snap-", text=True)
+    data = json.dumps(payload) + "\n"
+    dir_fd = _open_state_dir()
     try:
-        os.fchmod(tmp_fd, 0o600)
-    except OSError:
-        pass
-    try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp:
-            tmp.write(data)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        os.replace(tmp_path, _snapshot_path(workspace_id))
+        _atomic_write(
+            dir_fd, _snapshot_name(workspace_id), data, MAX_SNAPSHOT_BYTES
+        )
     finally:
-        try:
-            os.remove(tmp_path)
-        except FileNotFoundError:
-            pass
+        os.close(dir_fd)
 
 
 def load_snapshot(workspace_id: int) -> list:
     """Return the saved pre-grid layout for `workspace_id` as a list of dicts."""
+    dir_fd = _open_state_dir(create=False)
+    if dir_fd < 0:
+        return []
     try:
-        fd = os.open(_snapshot_path(workspace_id), _secure_flags(os.O_RDONLY))
-    except FileNotFoundError:
-        return []
-    with os.fdopen(fd, "r", encoding="utf-8") as handle:
-        data = handle.read(MAX_SNAPSHOT_BYTES + 1)
-    if len(data) > MAX_SNAPSHOT_BYTES:
-        return []
+        data = _read_file(dir_fd, _snapshot_name(workspace_id), MAX_SNAPSHOT_BYTES)
+    finally:
+        os.close(dir_fd)
     try:
         raw = json.loads(data) if data else []
     except json.JSONDecodeError:
@@ -533,10 +589,17 @@ def load_snapshot(workspace_id: int) -> list:
 
 
 def clear_snapshot(workspace_id: int) -> None:
+    dir_fd = _open_state_dir(create=False)
+    if dir_fd < 0:
+        return
     try:
-        os.unlink(_snapshot_path(workspace_id))
-    except FileNotFoundError:
-        pass
+        try:
+            os.unlink(_snapshot_name(workspace_id), dir_fd=dir_fd)
+            os.fsync(dir_fd)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(dir_fd)
 
 
 __all__ = [
