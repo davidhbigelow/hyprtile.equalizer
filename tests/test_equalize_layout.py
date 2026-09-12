@@ -152,6 +152,38 @@ class EqualizeLayoutTests(unittest.TestCase):
         self.assertGreaterEqual(fitted["0x5"][2], 400)
         self.assertGreaterEqual(fitted["0x6"][2], 250)
 
+    def _stub_rows(self, n, ws_size):
+        original_rows = w.current_rows
+        original_geometry = w.geometry
+        original_dispatch = w.dispatch
+
+        def rows(_mon, _ws):
+            return [
+                {
+                    "address": "0x%x" % (i + 1),
+                    "at": [0, 0],
+                    "size": [1, 1],
+                    "workspace": {"id": 1},
+                }
+                for i in range(n)
+            ]
+
+        w.current_rows = rows
+        w.geometry = lambda _mon: {"l": 0, "t": 0, "w": ws_size[0], "h": ws_size[1]}
+        w.dispatch = lambda _command: None
+        self.addCleanup(setattr, w, "current_rows", original_rows)
+        self.addCleanup(setattr, w, "geometry", original_geometry)
+        self.addCleanup(setattr, w, "dispatch", original_dispatch)
+
+    def _grid_rects(self, n):
+        cells = w.cell_list(None, 1)
+        rects = {
+            "0x%x" % (i + 1): (x, y, width, height)
+            for i, (_cx, _cy, x, y, width, height) in enumerate(cells)
+        }
+        cell_map = {"0x%x" % (i + 1): i for i in range(len(cells))}
+        return rects, cell_map
+
     def test_fill_off_restores_custom_pre_stretch_rectangle(self):
         original_cells = w.cell_list
         original_geometry = w.geometry
@@ -173,11 +205,101 @@ class EqualizeLayoutTests(unittest.TestCase):
             "off",
             {"0x1": (0, 0, 100, 100), "0x2": (150, 20, 250, 140)},
             {"0x1": 0, "0x2": 1},
-            ("0x2", "horizontal", custom),
+            ("horizontal", {"0x2": custom}),
         )
 
         self.assertEqual(restored["0x2"], custom)
-        self.assertEqual(state, (None, None, None))
+        self.assertEqual(state, (None, None))
+
+    def test_stretch_plan_adds_gap_tile_only_when_needed(self):
+        self.assertEqual(w.stretch_plan("vertical", 7), [("down", 5), ("gap", 6)])
+        self.assertEqual(w.stretch_plan("vertical", 8), [("down", 5)])
+        self.assertEqual(w.stretch_plan("vertical", 10), [("down", 7), ("gap", 9)])
+        self.assertEqual(w.stretch_plan("vertical", 11), [("down", 7)])
+        self.assertEqual(w.stretch_plan("vertical", 13), [("down", 11), ("gap", 12)])
+        self.assertEqual(w.stretch_plan("horizontal", 7), [("row", 6)])
+        self.assertEqual(w.stretch_plan("off", 7), [])
+        self.assertEqual(w.stretch_plan("vertical", 9), [])
+        self.assertEqual(w.stretch_plan("vertical", 2), [])
+
+    def test_extend_last_cell_closes_bottom_row_gap(self):
+        self._stub_rows(7, (1000, 600))
+        rects, cell_map = self._grid_rects(7)
+        targets = [(addr, *rect) for addr, rect in rects.items()]
+        filled = w.extend_last_cell(None, targets, cell_map, "vertical")
+        filled_map = {addr: (x, y, w, h) for addr, x, y, w, h in filled}
+
+        pad = w.GAPS_OUT + w.BORDER
+        bottom = int(round(w.geometry(None)["t"] + pad + w.geometry(None)["h"] - 2 * pad))
+        self.assertEqual(filled_map["0x6"][1] + filled_map["0x6"][3], bottom)
+        self.assertEqual(
+            filled_map["0x7"][0] + filled_map["0x7"][2],
+            filled_map["0x6"][0] - w.GRID_GAP,
+        )
+        for addr in ("0x1", "0x2", "0x3", "0x4", "0x5"):
+            self.assertEqual(filled_map[addr], rects[addr])
+
+    def test_extend_last_cell_no_gap_when_bottom_row_adjacent(self):
+        self._stub_rows(8, (1000, 600))
+        rects, cell_map = self._grid_rects(8)
+        targets = [(addr, *rect) for addr, rect in rects.items()]
+        filled = w.extend_last_cell(None, targets, cell_map, "vertical")
+        filled_map = {addr: (x, y, w, h) for addr, x, y, w, h in filled}
+
+        self.assertEqual(filled_map["0x8"], rects["0x8"])
+        self.assertNotEqual(filled_map["0x6"], rects["0x6"])
+
+    def test_apply_fill_in_place_vertical_stretches_both_tiles(self):
+        self._stub_rows(10, (1000, 600))
+        rects, cell_map = self._grid_rects(10)
+
+        updated, state = w.apply_fill_in_place(
+            None, 1, "vertical", rects, cell_map, (None, None)
+        )
+
+        self.assertEqual(state[0], "vertical")
+        self.assertIn("0x8", state[1])
+        self.assertIn("0xa", state[1])
+        self.assertEqual(
+            updated["0xa"][0] + updated["0xa"][2],
+            updated["0x8"][0] - w.GRID_GAP,
+        )
+
+    def test_apply_fill_horizontal_to_vertical_does_not_overlap(self):
+        self._stub_rows(7, (1000, 600))
+        rects, cell_map = self._grid_rects(7)
+
+        horiz_rects, horiz_state = w.apply_fill_in_place(
+            None, 1, "horizontal", rects, cell_map, (None, None)
+        )
+        vert_rects, vert_state = w.apply_fill_in_place(
+            None, 1, "vertical", horiz_rects, cell_map, horiz_state
+        )
+
+        pad = w.GAPS_OUT + w.BORDER
+        bottom = int(round(w.geometry(None)["t"] + pad + w.geometry(None)["h"] - 2 * pad))
+        self.assertEqual(vert_rects["0x7"][1] + vert_rects["0x7"][3],
+                         rects["0x7"][1] + rects["0x7"][3])
+        self.assertEqual(vert_rects["0x7"][0] + vert_rects["0x7"][2],
+                         vert_rects["0x6"][0] - w.GRID_GAP)
+        self.assertEqual(vert_rects["0x6"][1] + vert_rects["0x6"][3], bottom)
+        self.assertEqual(vert_state[0], "vertical")
+        self.assertIn("0x6", vert_state[1])
+        self.assertIn("0x7", vert_state[1])
+
+    def test_apply_fill_off_restores_both_stretched_tiles(self):
+        self._stub_rows(10, (1000, 600))
+        rects, cell_map = self._grid_rects(10)
+        updated, state = w.apply_fill_in_place(
+            None, 1, "vertical", rects, cell_map, (None, None)
+        )
+
+        off_updated, off_state = w.apply_fill_in_place(
+            None, 1, "off", updated, cell_map, state
+        )
+
+        self.assertEqual(off_state, (None, None))
+        self.assertEqual(off_updated, rects)
 
     def test_logical_target_ignores_unoccupied_space_to_right(self):
         rects = {"0x1": (0, 0, 300, 300), "0x2": (318, 0, 618, 300)}
