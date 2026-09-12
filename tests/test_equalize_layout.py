@@ -308,6 +308,42 @@ class EqualizeLayoutTests(unittest.TestCase):
         self.assertEqual(w.logical_swap_target(rects, cells, "0x1", "right"), "0x2")
         self.assertIsNone(w.logical_swap_target(rects, cells, "0x2", "right"))
 
+    def test_logical_swap_target_vertical_gap_finds_physical_right_tile(self):
+        self._stub_rows(7, (1000, 600))
+        rects, cell_map = self._grid_rects(7)
+        stretched = w.extend_last_cell(
+            None, [(a, *r) for a, r in rects.items()], cell_map, "vertical"
+        )
+        physical = {a: (x, y, w, h) for a, x, y, w, h in stretched}
+
+        self.assertEqual(
+            w.logical_swap_target(physical, cell_map, "0x7", "right"), "0x6"
+        )
+        self.assertIsNone(w.logical_swap_target(physical, cell_map, "0x6", "right"))
+
+    def test_gap_swap_relocates_stretch_to_new_owners(self):
+        self._stub_rows(7, (1000, 600))
+        rects, cell_map = self._grid_rects(7)
+        stretched = w.extend_last_cell(
+            None, [(a, *r) for a, r in rects.items()], cell_map, "vertical"
+        )
+        physical = {a: (x, y, w, h) for a, x, y, w, h in stretched}
+        state = ("vertical", {a: rects[a] for a in ("0x6", "0x7")})
+
+        base = w.remove_stretch(physical, state)
+        swapped, new_cells = w._swap_slots(base, cell_map, "0x7", "0x6")
+        filled, new_state = w.fill_layout(None, 1, swapped, new_cells, "vertical")
+
+        pad = w.GAPS_OUT + w.BORDER
+        bottom = int(round(w.geometry(None)["t"] + pad + w.geometry(None)["h"] - 2 * pad))
+        self.assertEqual(filled["0x7"][1] + filled["0x7"][3], bottom)
+        self.assertEqual(
+            filled["0x6"][0] + filled["0x6"][2], filled["0x7"][0] - w.GRID_GAP
+        )
+        self.assertEqual(new_state[0], "vertical")
+        self.assertIn("0x6", new_state[1])
+        self.assertIn("0x7", new_state[1])
+
     def test_keyboard_swap_is_detected_as_two_position_changes(self):
         rects, _ = grid()
         original = w.current_rows

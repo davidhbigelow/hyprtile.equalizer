@@ -1105,12 +1105,40 @@ def swap_logical_layout(rects, cell_map, moved_addr, direction):
     return _swap_slots(rects, cell_map, moved_addr, destination)
 
 
+def _nearest_physical(rects, moved_addr, direction, sx, sy):
+    """Windows whose rect lies wholly to one horizontal side of `moved_addr`,
+    ranked by horizontal separation then vertical centre distance.
+
+    Used when a row has no logical neighbour in the requested direction: a
+    vertically stretched tile can occupy the space physically beside a gap or
+    down tile while owning a cell on another row, so the swap must target what
+    is actually adjacent on screen.
+    """
+    source = rects[moved_addr]
+    out = []
+    for addr, rect in rects.items():
+        if addr == moved_addr:
+            continue
+        if direction == "right":
+            if rect[0] < source[0] + source[2]:
+                continue
+            gap = rect[0] - (source[0] + source[2])
+        else:
+            if rect[0] + rect[2] > source[0]:
+                continue
+            gap = source[0] - (rect[0] + rect[2])
+        cy = rect[1] + rect[3] / 2
+        out.append((gap, abs(cy - sy), addr))
+    return out
+
+
 def logical_swap_target(rects, cell_map, moved_addr, direction):
     """Address in the adjacent occupied slot, or None at a grid edge."""
     if moved_addr not in rects or moved_addr not in cell_map:
         return None
     source = rects[moved_addr]
     sx = source[0] + source[2] / 2
+    sy = source[1] + source[3] / 2
     cols = max(1, math.ceil(math.sqrt(len(rects))))
     source_row, source_col = divmod(cell_map[moved_addr], cols)
     candidates = []
@@ -1120,6 +1148,8 @@ def logical_swap_target(rects, cell_map, moved_addr, direction):
             row, col = divmod(cell, cols)
             if row == source_row and (col - source_col) * sign > 0:
                 candidates.append((abs(col - source_col), addr))
+        if not candidates:
+            candidates = _nearest_physical(rects, moved_addr, direction, sx, sy)
     else:
         sign = 1 if direction == "down" else -1
         for addr, cell in cell_map.items():
