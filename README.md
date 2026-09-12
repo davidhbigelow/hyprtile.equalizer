@@ -134,6 +134,18 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 David Bigelow.
 
 ## Changelog
 
+### 1.3.1
+- Fixed a vertical-fill settle flicker: stretch tiles no longer collapse and
+  re-stretch on the way into place, and toggling horizontal→vertical no longer
+  leaves the previously stretched tile overlapping its neighbour.
+- Vertical fill with a bottom-row gap (7+ tiles) now stretches the tile left of
+  the empty cell rightward to close the hole; stretch roles follow the windows
+  after a swap, so the newly swapped tiles keep the correct stretch.
+- `SUPER+SHIFT+Arrow` swaps now target the window physically adjacent on the
+  requested side — including the vertically stretched neighbour of a
+  bottom-row gap tile — instead of only same-row logical slot neighbours, so
+  keyboard swaps work at every edge of the grid.
+
 ### 1.3.0
 - Replaced column-wide resize pinning with persistent slot geometry: width
   changes stay within one row, while height changes rebalance complete row
