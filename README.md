@@ -1,4 +1,5 @@
 # Equalize Toggle
+[![Built for Omarchy: Plugin](https://raw.githubusercontent.com/tcballard/omarchy-badges/75975e5b5bf75e7ede3764bcd2950046f7abfe2c/badges/v1/omarchy-plugin.svg)](https://github.com/tcballard/omarchy-badges)
 
 Toggle live window-equalize mode on any Hyprland workspace with `SUPER+E`.
 Press once to lock every window into a perfectly tiled floating grid; press
