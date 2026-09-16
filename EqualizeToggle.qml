@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Shapes
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -15,7 +16,10 @@ Panel {
   property bool refreshPending: false
   property string focusSection: "header"
   property bool cursorActive: false
-  readonly property string pluginVersion: "1.3.1"
+  readonly property string pluginVersion: "1.3.2"
+
+  readonly property string donateUrl: "https://www.buymeacoffee.com/davidhbigelow"
+  readonly property string mugPath: "M152 56c-13.3 0-24 10.7-24 24 0 38.9 23.4 59.4 39.1 73.1l1.1 1c16.3 14.3 23.8 21.8 23.8 37.9 0 13.3 10.7 24 24 24s24-10.7 24-24c0-38.9-23.4-59.4-39.1-73.1l-1.1-1C183.5 103.7 176 96.1 176 80 176 66.7 165.3 56 152 56zM96 264c-17.7 0-32 14.3-32 32l0 192c0 53 43 96 96 96l192 0c41.8 0 77.4-26.7 90.5-64l5.5 0c70.7 0 128-57.3 128-128S518.7 264 448 264L96 264zM448 456l0-128c35.3 0 64 28.7 64 64s-28.7 64-64 64zM288 80c0-13.3-10.7-24-24-24S240 66.7 240 80c0 38.9 23.4 59.4 39.1 73.1l1.1 1c16.3 14.3 23.8 21.8 23.8 37.9 0 13.3 10.7 24 24 24s24-10.7 24-24c0-38.9-23.4-59.4-39.1-73.1l-1.1-1C295.5 103.7 288 96.1 288 80z"
 
   readonly property string scriptsDir: {
     var url = Qt.resolvedUrl("scripts")
@@ -222,6 +226,45 @@ Panel {
       onTextKey: function(t) {
         if (t === "e" || t === "E") root.toggleLive()
         else if (t === "f" || t === "F") root.toggleFill()
+      }
+
+      Item {
+        id: donateBadge
+        anchors.top: parent.top
+        anchors.right: parent.right
+        width: Style.space(26)
+        height: Style.space(26)
+
+        Shape {
+          anchors.centerIn: parent
+          width: 640
+          height: 512
+          antialiasing: true
+          layer.enabled: true
+          layer.samples: 4
+          transformOrigin: Item.Center
+          scale: Math.min(donateBadge.width / 640, donateBadge.height / 512)
+
+          ShapePath {
+            fillColor: donateMouse.containsMouse ? root.panelForeground : Qt.darker(root.panelForeground, 1.35)
+            strokeWidth: 0
+            PathSvg { path: root.mugPath }
+          }
+        }
+
+        MouseArea {
+          id: donateMouse
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: Qt.openUrlExternally(root.donateUrl)
+        }
+
+        PanelToolTip {
+          visible: donateMouse.containsMouse
+          text: "Buy me a coffee"
+          fontFamily: root.panelFontFamily
+        }
       }
 
       Column {
