@@ -138,6 +138,11 @@ MIT — see [`LICENSE`](./LICENSE). Copyright (c) 2026 David Bigelow.
 
 ## Changelog
 
+### 1.3.2
+- Added a Buy Me a Coffee mug badge to the panel header (top-right corner of
+  the dialog). Hover shows a "Buy me a coffee" tooltip; clicking opens
+  https://www.buymeacoffee.com/davidhbigelow in the browser.
+
 ### 1.3.1
 - Fixed a vertical-fill settle flicker: stretch tiles no longer collapse and
   re-stretch on the way into place, and toggling horizontal→vertical no longer
